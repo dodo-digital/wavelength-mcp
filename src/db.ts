@@ -1,4 +1,4 @@
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import { neon } from "@neondatabase/serverless";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,17 +25,18 @@ export interface HealthCheckResult {
 // Client
 // ---------------------------------------------------------------------------
 
-let _client: SupabaseClient | null = null;
+type SqlClient = ReturnType<typeof neon>;
 
-export function getDb(): SupabaseClient | null {
-  if (_client) return _client;
+let _sql: SqlClient | null = null;
 
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_KEY;
-  if (!url || !key) return null;
+export function getSql(): SqlClient | null {
+  if (_sql) return _sql;
 
-  _client = createClient(url, key);
-  return _client;
+  const url = process.env.POSTGRES_URL;
+  if (!url) return null;
+
+  _sql = neon(url);
+  return _sql;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,18 +44,17 @@ export function getDb(): SupabaseClient | null {
 // ---------------------------------------------------------------------------
 
 export async function resolveUser(
-  db: SupabaseClient,
+  sql: SqlClient,
   token: string
 ): Promise<{ id: string; name: string } | null> {
-  const { data, error } = await db
-    .from("wl_users")
-    .select("id, name")
-    .eq("token", token)
-    .eq("is_active", true)
-    .single();
+  const rows = await sql`
+    SELECT id, name FROM wl_users
+    WHERE token = ${token} AND is_active = true
+    LIMIT 1
+  ` as Record<string, string>[];
 
-  if (error || !data) return null;
-  return { id: data.id, name: data.name };
+  if (rows.length === 0) return null;
+  return { id: rows[0].id, name: rows[0].name };
 }
 
 // ---------------------------------------------------------------------------
@@ -62,20 +62,23 @@ export async function resolveUser(
 // ---------------------------------------------------------------------------
 
 export async function logCall(
-  db: SupabaseClient,
+  sql: SqlClient,
   userId: string | null,
   entry: CallLogEntry
 ): Promise<void> {
-  await db.from("wl_calls").insert({
-    user_id: userId,
-    tool: entry.tool,
-    provider: entry.provider ?? null,
-    email_count: entry.email_count,
-    credits_used: entry.credits_used,
-    status: entry.status,
-    error_message: entry.error_message ?? null,
-    duration_ms: entry.duration_ms,
-  });
+  await sql`
+    INSERT INTO wl_calls (user_id, tool, provider, email_count, credits_used, status, error_message, duration_ms)
+    VALUES (
+      ${userId},
+      ${entry.tool},
+      ${entry.provider ?? null},
+      ${entry.email_count},
+      ${entry.credits_used},
+      ${entry.status},
+      ${entry.error_message ?? null},
+      ${entry.duration_ms}
+    )
+  `;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,15 +86,18 @@ export async function logCall(
 // ---------------------------------------------------------------------------
 
 export async function logHealthCheck(
-  db: SupabaseClient,
+  sql: SqlClient,
   result: HealthCheckResult
 ): Promise<void> {
-  await db.from("wl_health_checks").insert({
-    provider: result.provider,
-    check_type: result.check_type,
-    status: result.status,
-    details: result.details ?? null,
-  });
+  await sql`
+    INSERT INTO wl_health_checks (provider, check_type, status, details)
+    VALUES (
+      ${result.provider},
+      ${result.check_type},
+      ${result.status},
+      ${JSON.stringify(result.details ?? null)}
+    )
+  `;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 -- Wavelength MCP call tracking schema
--- Run this in your Supabase SQL editor
+-- Run this in the Neon SQL editor (Vercel Dashboard → Storage → your DB → SQL Editor)
 
 -- Users table (per-user token auth)
 create table if not exists wl_users (
@@ -40,6 +40,10 @@ create index if not exists idx_wl_calls_user_id on wl_calls(user_id);
 create index if not exists idx_wl_calls_tool on wl_calls(tool);
 create index if not exists idx_wl_health_checks_created_at on wl_health_checks(created_at desc);
 
--- Seed: Insert the shared team token so existing users are tracked
--- Run this after setting up the tables, replacing YOUR_TOKEN with WL_MCP_TOKEN value
+-- Seed: Insert the shared team token so existing users are tracked.
+-- Replace YOUR_TOKEN with the actual WL_MCP_TOKEN value.
 -- insert into wl_users (name, token) values ('team-shared', 'YOUR_TOKEN_HERE');
+
+-- Later, add per-user tokens:
+-- insert into wl_users (name, token) values ('dino', 'generated-token-for-dino');
+-- insert into wl_users (name, token) values ('giani', 'generated-token-for-giani');

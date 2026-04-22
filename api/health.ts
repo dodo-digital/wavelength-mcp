@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getDb, logHealthCheck } from "../src/db.js";
+import { getSql, logHealthCheck } from "../src/db.js";
 
 // ---------------------------------------------------------------------------
 // Health check endpoint — runs via Vercel Cron every 4 hours
@@ -103,17 +103,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     checkZeroBounce(),
   ]);
 
-  const db = getDb();
+  const sql = getSql();
 
-  if (db) {
+  if (sql) {
     await Promise.all([
-      logHealthCheck(db, {
+      logHealthCheck(sql, {
         provider: "clearout",
         check_type: "credits",
         status: clearout.status,
         details: clearout.details,
       }),
-      logHealthCheck(db, {
+      logHealthCheck(sql, {
         provider: "zerobounce",
         check_type: "credits",
         status: zerobounce.status,

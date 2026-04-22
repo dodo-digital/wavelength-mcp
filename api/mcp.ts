@@ -2,7 +2,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../src/index.js";
 import {
-  getDb,
+  getSql,
   resolveUser,
   logCall,
   inferProvider,
@@ -28,10 +28,10 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
   const token = header.slice(7);
 
   // Try per-user token from DB
-  const db = getDb();
-  if (db) {
+  const sql = getSql();
+  if (sql) {
     try {
-      const user = await resolveUser(db, token);
+      const user = await resolveUser(sql, token);
       if (user) {
         return { authenticated: true, userId: user.id, token };
       }
@@ -133,9 +133,9 @@ export default async function handler(
 
       // Log tool calls to DB (non-blocking, best-effort)
       if (toolCall) {
-        const db = getDb();
-        if (db) {
-          await logCall(db, auth.userId, {
+        const sql = getSql();
+        if (sql) {
+          await logCall(sql, auth.userId, {
             tool: toolCall.tool,
             provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
             email_count: countEmails(toolCall.args),
@@ -148,9 +148,9 @@ export default async function handler(
     } catch (err) {
       // Log failed tool calls
       if (toolCall) {
-        const db = getDb();
-        if (db) {
-          await logCall(db, auth.userId, {
+        const sql = getSql();
+        if (sql) {
+          await logCall(sql, auth.userId, {
             tool: toolCall.tool,
             provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
             email_count: countEmails(toolCall.args),
