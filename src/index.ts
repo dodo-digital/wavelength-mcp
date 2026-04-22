@@ -255,6 +255,238 @@ function isZBCreditExhausted(errorMsg: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Bulk validation clients
+// ---------------------------------------------------------------------------
+
+const ZEROBOUNCE_BULK_BASE = "https://bulkapi.zerobounce.net/v2";
+
+function emailsToCsv(emails: string[]): string {
+  return "email\n" + emails.join("\n");
+}
+
+function parseCsvLine(line: string): string[] {
+  const fields: string[] = [];
+  let current = "";
+  let inQuote = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuote) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          inQuote = false;
+        }
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"') {
+      inQuote = true;
+    } else if (ch === ",") {
+      fields.push(current);
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  fields.push(current);
+  return fields;
+}
+
+function parseCsv(csv: string): Record<string, string>[] {
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+
+  const headers = parseCsvLine(lines[0]).map((h) => h.trim());
+  return lines
+    .slice(1)
+    .filter((l) => l.trim())
+    .map((line) => {
+      const values = parseCsvLine(line);
+      const row: Record<string, string> = {};
+      headers.forEach((h, i) => {
+        row[h] = (values[i] ?? "").trim();
+      });
+      return row;
+    });
+}
+
+// -- Clearout bulk --
+
+async function clearoutBulkSubmit(emails: string[]): Promise<string> {
+  const csv = emailsToCsv(emails);
+  const formData = new FormData();
+  formData.append(
+    "file",
+    new Blob([csv], { type: "text/csv" }),
+    "emails.csv"
+  );
+  formData.append("optimize", "highest_accuracy");
+
+  const res = await fetch(`${CLEAROUT_BASE}/email_verify/bulk`, {
+    method: "POST",
+    headers: { Authorization: `Bearer:${getClearoutKey()}` },
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Clearout bulk API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as {
+    status: string;
+    data?: { list_id: string };
+    error?: { message: string };
+  };
+
+  if (json.status === "error" || !json.data?.list_id) {
+    throw new Error(
+      `Clearout bulk submit failed: ${json.error?.message ?? JSON.stringify(json)}`
+    );
+  }
+
+  return json.data.list_id;
+}
+
+async function clearoutBulkStatus(
+  listId: string
+): Promise<{ progress_status: string; percentile: number }> {
+  const params = new URLSearchParams({ list_id: listId });
+  const res = await fetch(
+    `${CLEAROUT_BASE}/email_verify/bulk/progress_status?${params}`,
+    { headers: { Authorization: `Bearer:${getClearoutKey()}` } }
+  );
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Clearout status API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as {
+    status: string;
+    data?: { progress_status: string; percentile: number };
+  };
+
+  return {
+    progress_status: json.data?.progress_status ?? "unknown",
+    percentile: json.data?.percentile ?? 0,
+  };
+}
+
+async function clearoutBulkResults(listId: string): Promise<string> {
+  const res = await fetch(`${CLEAROUT_BASE}/download/result`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer:${getClearoutKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ list_id: listId }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Clearout download API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as {
+    status: string;
+    data?: { url: string };
+    error?: { message: string };
+  };
+
+  if (json.status === "error" || !json.data?.url) {
+    throw new Error(
+      `Clearout download failed: ${json.error?.message ?? "no URL returned"}`
+    );
+  }
+
+  const fileRes = await fetch(json.data.url);
+  if (!fileRes.ok) {
+    throw new Error(`Failed to download results file: ${fileRes.status}`);
+  }
+
+  return await fileRes.text();
+}
+
+// -- ZeroBounce bulk --
+
+async function zbBulkSubmit(emails: string[]): Promise<string> {
+  const csv = emailsToCsv(emails);
+  const formData = new FormData();
+  formData.append("api_key", getZBKey());
+  formData.append("email_address_column", "1");
+  formData.append("has_header_row", "true");
+  formData.append(
+    "file",
+    new Blob([csv], { type: "text/csv" }),
+    "emails.csv"
+  );
+
+  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/sendfile`, {
+    method: "POST",
+    body: formData,
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ZeroBounce bulk API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as {
+    success: boolean;
+    file_id?: string;
+    message?: string;
+  };
+
+  if (!json.success || !json.file_id) {
+    throw new Error(
+      `ZeroBounce bulk submit failed: ${json.message ?? "Unknown error"}`
+    );
+  }
+
+  return json.file_id;
+}
+
+async function zbBulkStatus(
+  fileId: string
+): Promise<{ file_status: string; complete_percentage: string }> {
+  const params = new URLSearchParams({
+    api_key: getZBKey(),
+    file_id: fileId,
+  });
+  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/filestatus?${params}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ZeroBounce status API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as Record<string, unknown>;
+  return {
+    file_status: String(json.file_status ?? "unknown"),
+    complete_percentage: String(json.complete_percentage ?? "0"),
+  };
+}
+
+async function zbBulkResults(fileId: string): Promise<string> {
+  const params = new URLSearchParams({
+    api_key: getZBKey(),
+    file_id: fileId,
+  });
+  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/getfile?${params}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ZeroBounce results API ${res.status}: ${body}`);
+  }
+
+  return await res.text();
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
@@ -267,12 +499,12 @@ export function createServer(): McpServer {
   // -- validate_email --------------------------------------------------------
   server.tool(
     "validate_email",
-    "Validate one or more email addresses via Clearout. Returns deliverability verdict, disposable/free/role flags, and bounce type. Costs 1 credit per email. Pass a single email string or an array of up to 50.",
+    "Validate up to 20 email addresses via Clearout (instant, real-time). Returns deliverability verdict, disposable/free/role flags, and bounce type. Costs 1 credit per email. For more than 20 emails, use bulk_validate instead.",
     {
       email: z
         .union([
           z.string().email(),
-          z.array(z.string().email()).min(1).max(50),
+          z.array(z.string().email()).min(1).max(20),
         ])
         .describe("A single email address or array of email addresses"),
     },
@@ -444,12 +676,12 @@ export function createServer(): McpServer {
   // -- zb_validate_email -----------------------------------------------------
   server.tool(
     "zb_validate_email",
-    "Validate one or more email addresses via ZeroBounce. Returns status, sub_status, free_email, domain age, MX records, SMTP provider. Costs 1 credit per email (0 for unknown results). Pass a single email string or an array of up to 50.",
+    "Validate up to 20 email addresses via ZeroBounce (instant, real-time). Returns status, sub_status, free_email, domain age, MX records, SMTP provider. Costs 1 credit per email (0 for unknown results). For more than 20 emails, use bulk_validate instead.",
     {
       email: z
         .union([
           z.string().email(),
-          z.array(z.string().email()).min(1).max(50),
+          z.array(z.string().email()).min(1).max(20),
         ])
         .describe("A single email address or array of email addresses"),
     },
@@ -606,6 +838,194 @@ export function createServer(): McpServer {
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
+    }
+  );
+
+  // -- bulk_validate ---------------------------------------------------------
+  server.tool(
+    "bulk_validate",
+    "Submit a batch of emails for async validation (use for more than 20 emails). Returns a job_id to track progress. Processing takes 2-10 minutes depending on batch size. Call bulk_status to check progress, then bulk_results to retrieve data.",
+    {
+      provider: z
+        .enum(["clearout", "zerobounce"])
+        .describe("Which validation provider to use"),
+      emails: z
+        .array(z.string().email())
+        .min(1)
+        .max(10000)
+        .describe("Array of email addresses to validate"),
+    },
+    async ({ provider, emails }) => {
+      try {
+        const jobId =
+          provider === "clearout"
+            ? await clearoutBulkSubmit(emails)
+            : await zbBulkSubmit(emails);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  provider,
+                  job_id: jobId,
+                  email_count: emails.length,
+                  status: "submitted",
+                  next_step: `Call bulk_status with provider="${provider}" and job_id="${jobId}" to check progress.`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- bulk_status ----------------------------------------------------------
+  server.tool(
+    "bulk_status",
+    "Check progress of a bulk validation job. Returns completion percentage and whether results are ready to download.",
+    {
+      provider: z
+        .enum(["clearout", "zerobounce"])
+        .describe("Which provider the job was submitted to"),
+      job_id: z.string().describe("The job_id returned from bulk_validate"),
+    },
+    async ({ provider, job_id }) => {
+      try {
+        let status: Record<string, unknown>;
+
+        if (provider === "clearout") {
+          const s = await clearoutBulkStatus(job_id);
+          const done =
+            s.progress_status.toLowerCase() === "completed" ||
+            s.percentile >= 100;
+          status = {
+            provider,
+            job_id,
+            status: s.progress_status,
+            complete_percentage: s.percentile,
+            is_complete: done,
+          };
+        } else {
+          const s = await zbBulkStatus(job_id);
+          const done = s.file_status === "Complete";
+          status = {
+            provider,
+            job_id,
+            status: s.file_status,
+            complete_percentage: s.complete_percentage,
+            is_complete: done,
+          };
+        }
+
+        status.next_step = status.is_complete
+          ? `Call bulk_results with provider="${provider}" and job_id="${job_id}" to download results.`
+          : "Not complete yet. Check again in 30 seconds.";
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(status, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- bulk_results ---------------------------------------------------------
+  server.tool(
+    "bulk_results",
+    "Download results of a completed bulk validation job. Returns structured validation data for each email. Only call after bulk_status shows is_complete: true.",
+    {
+      provider: z
+        .enum(["clearout", "zerobounce"])
+        .describe("Which provider the job was submitted to"),
+      job_id: z.string().describe("The job_id returned from bulk_validate"),
+    },
+    async ({ provider, job_id }) => {
+      try {
+        const csvText =
+          provider === "clearout"
+            ? await clearoutBulkResults(job_id)
+            : await zbBulkResults(job_id);
+
+        const parsed = parseCsv(csvText);
+
+        if (parsed.length === 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: "No results parsed from response",
+                    raw_preview: csvText.slice(0, 500),
+                    _schema_warning:
+                      "Response format may have changed. Raw preview included for diagnosis.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  provider,
+                  job_id,
+                  total_results: parsed.length,
+                  results: parsed,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
