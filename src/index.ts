@@ -144,6 +144,117 @@ function isCreditExhausted(errorMsg: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// ZeroBounce API client
+// ---------------------------------------------------------------------------
+
+const ZEROBOUNCE_BASE = "https://api.zerobounce.net/v2";
+
+interface ZBVerifyResult {
+  address: string;
+  status: string;
+  sub_status: string;
+  free_email: boolean;
+  did_you_mean: string | null;
+  domain: string | null;
+  domain_age_days: string;
+  smtp_provider: string;
+  mx_found: string;
+  mx_record: string;
+  firstname: string;
+  lastname: string;
+  gender: string;
+  _schema_warning?: string;
+}
+
+function getZBKey(): string {
+  const key = process.env.ZEROBOUNCE_API_KEY;
+  if (!key) throw new Error("ZEROBOUNCE_API_KEY not set");
+  return key;
+}
+
+function validateZBResponseShape(
+  data: Record<string, unknown>
+): string | null {
+  const required = ["address", "status"];
+  const missing = required.filter((k) => !(k in data));
+  if (missing.length > 0) {
+    return `ZeroBounce response missing fields: ${missing.join(", ")}. API may have changed.`;
+  }
+  return null;
+}
+
+async function zbVerifyEmail(email: string): Promise<ZBVerifyResult> {
+  const params = new URLSearchParams({
+    api_key: getZBKey(),
+    email,
+    ip_address: "",
+  });
+
+  const res = await fetch(`${ZEROBOUNCE_BASE}/validate?${params}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ZeroBounce API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as Record<string, unknown>;
+
+  if (json.error) {
+    throw new Error(`ZeroBounce error: ${String(json.error)}`);
+  }
+
+  const warning = validateZBResponseShape(json);
+  const result: ZBVerifyResult = {
+    address: String(json.address ?? ""),
+    status: String(json.status ?? ""),
+    sub_status: String(json.sub_status ?? ""),
+    free_email: Boolean(json.free_email),
+    did_you_mean: (json.did_you_mean as string | null) ?? null,
+    domain: (json.domain as string | null) ?? null,
+    domain_age_days: String(json.domain_age_days ?? ""),
+    smtp_provider: String(json.smtp_provider ?? ""),
+    mx_found: String(json.mx_found ?? ""),
+    mx_record: String(json.mx_record ?? ""),
+    firstname: String(json.firstname ?? ""),
+    lastname: String(json.lastname ?? ""),
+    gender: String(json.gender ?? ""),
+  };
+
+  if (warning) result._schema_warning = warning;
+
+  return result;
+}
+
+async function getZBCredits(): Promise<number> {
+  const params = new URLSearchParams({ api_key: getZBKey() });
+  const res = await fetch(`${ZEROBOUNCE_BASE}/getcredits?${params}`);
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`ZeroBounce API ${res.status}: ${body}`);
+  }
+
+  const json = (await res.json()) as { Credits: number };
+
+  if (json.Credits === -1) {
+    throw new Error("ZeroBounce: Invalid API key");
+  }
+
+  return json.Credits;
+}
+
+function isZBCreditExhausted(errorMsg: string): boolean {
+  const lower = errorMsg.toLowerCase();
+  return (
+    lower.includes("insufficient credit") ||
+    lower.includes("no credits") ||
+    lower.includes("credits exhausted") ||
+    lower.includes("zerobounce api 402") ||
+    lower.includes("invalid api key")
+  );
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
 
@@ -330,37 +441,210 @@ export function createServer(): McpServer {
     }
   );
 
+  // -- zb_validate_email -----------------------------------------------------
+  server.tool(
+    "zb_validate_email",
+    "Validate one or more email addresses via ZeroBounce. Returns status, sub_status, free_email, domain age, MX records, SMTP provider. Costs 1 credit per email (0 for unknown results). Pass a single email string or an array of up to 50.",
+    {
+      email: z
+        .union([
+          z.string().email(),
+          z.array(z.string().email()).min(1).max(50),
+        ])
+        .describe("A single email address or array of email addresses"),
+    },
+    async ({ email }) => {
+      const emails = Array.isArray(email) ? email : [email];
+
+      // Single email — simple path
+      if (emails.length === 1) {
+        try {
+          const result = await zbVerifyEmail(emails[0]);
+
+          let creditsRemaining: number | null = null;
+          try {
+            creditsRemaining = await getZBCredits();
+          } catch {
+            // best-effort
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    ...result,
+                    _credits_used: result.status === "unknown" ? 0 : 1,
+                    _credits_remaining: creditsRemaining,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: isZBCreditExhausted(msg)
+                  ? JSON.stringify(
+                      {
+                        error:
+                          "ZeroBounce credits exhausted. Purchase more at zerobounce.net to continue.",
+                        credits_used: 0,
+                      },
+                      null,
+                      2
+                    )
+                  : `Error: ${msg}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+
+      // Multiple emails — pre-flight credit check, then sequential
+      try {
+        const avail = await getZBCredits();
+        if (avail < emails.length) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: `Insufficient ZeroBounce credits. You have ${avail} but requested ${emails.length} validations.`,
+                    credits_remaining: avail,
+                    suggestion:
+                      avail > 0
+                        ? `Reduce batch to ${avail} emails or purchase more credits.`
+                        : "Purchase more credits at zerobounce.net to continue.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+      } catch {
+        // Pre-flight is best-effort
+      }
+
+      const results: Array<
+        ZBVerifyResult | { email: string; error: string }
+      > = [];
+      let rateLimited = false;
+      let creditExhausted = false;
+      let creditsUsed = 0;
+
+      for (let i = 0; i < emails.length; i++) {
+        const addr = emails[i];
+
+        if (rateLimited || creditExhausted) {
+          results.push({
+            email: addr,
+            error: creditExhausted
+              ? "Skipped — credits exhausted"
+              : "Skipped — rate limited",
+          });
+          continue;
+        }
+
+        try {
+          const result = await zbVerifyEmail(addr);
+          results.push(result);
+          if (result.status !== "unknown") creditsUsed++;
+
+          if (i < emails.length - 1) {
+            await new Promise((r) => setTimeout(r, 200));
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (isZBCreditExhausted(msg)) {
+            creditExhausted = true;
+            results.push({ email: addr, error: "Credits exhausted" });
+          } else if (
+            msg.includes("429") ||
+            msg.toLowerCase().includes("rate")
+          ) {
+            rateLimited = true;
+            results.push({ email: addr, error: "Rate limited" });
+          } else {
+            results.push({ email: addr, error: msg });
+          }
+        }
+      }
+
+      // Post-flight credit balance
+      let creditsRemaining: number | null = null;
+      try {
+        creditsRemaining = await getZBCredits();
+      } catch {
+        // non-fatal
+      }
+
+      const summary = {
+        total: emails.length,
+        completed: results.filter((r) => "status" in r).length,
+        errors: results.filter((r) => "error" in r).length,
+        credits_used: creditsUsed,
+        credits_remaining: creditsRemaining,
+        rate_limited: rateLimited,
+        credit_exhausted: creditExhausted,
+        results,
+      };
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(summary, null, 2) },
+        ],
+      };
+    }
+  );
+
   // -- check_credits ---------------------------------------------------------
   server.tool(
     "check_credits",
-    "Check remaining Clearout email verification credits. Costs 0 credits.",
+    "Check remaining email verification credits for all providers (Clearout and ZeroBounce). Costs 0 credits.",
     {},
     async () => {
+      const report: Record<string, unknown> = {};
+
       try {
         const { credits } = await getCredits();
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                { credits, note: "1 credit = 1 email verification" },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        report.clearout = credits;
       } catch (err) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
-            },
-          ],
-          isError: true,
+        report.clearout = {
+          error: err instanceof Error ? err.message : String(err),
         };
       }
+
+      try {
+        const credits = await getZBCredits();
+        report.zerobounce = { available: credits };
+      } catch (err) {
+        report.zerobounce = {
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+
+      report.note = "1 credit = 1 email verification per provider";
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(report, null, 2),
+          },
+        ],
+      };
     }
   );
 
