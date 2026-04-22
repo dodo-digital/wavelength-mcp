@@ -4,6 +4,7 @@
   "outputDirectory": ".",
   "framework": null,
   "rewrites": [
+    { "source": "/mcp/:token", "destination": "/api/mcp" },
     { "source": "/mcp", "destination": "/api/mcp" },
     { "source": "/health", "destination": "/api/health" }
   ],

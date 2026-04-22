@@ -13,13 +13,24 @@ interface AuthResult {
   token: string;
 }
 
-async function authenticate(req: VercelRequest): Promise<AuthResult> {
+function extractToken(req: VercelRequest): string | null {
+  // 1. Bearer header (Claude Code / .mcp.json)
   const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) {
+  if (header?.startsWith("Bearer ")) return header.slice(7);
+
+  // 2. URL path: /mcp/<token> (Cowork custom connector)
+  const url = req.url ?? "";
+  const match = url.match(/^\/mcp\/([A-Za-z0-9_\-]{20,})(?:\?|$)/);
+  if (match) return match[1];
+
+  return null;
+}
+
+async function authenticate(req: VercelRequest): Promise<AuthResult> {
+  const token = extractToken(req);
+  if (!token) {
     return { authenticated: false, userId: null, token: "" };
   }
-
-  const token = header.slice(7);
 
   // Try per-user token from DB
   const sql = getSql();
