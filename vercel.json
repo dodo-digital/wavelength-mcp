@@ -1,0 +1,14 @@
+{
+  "buildCommand": "npm run build",
+  "installCommand": "npm install",
+  "outputDirectory": ".",
+  "framework": null,
+  "rewrites": [
+    { "source": "/mcp", "destination": "/api/mcp" }
+  ],
+  "functions": {
+    "api/mcp.ts": {
+      "maxDuration": 60
+    }
+  }
+}
