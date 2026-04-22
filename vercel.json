@@ -4,11 +4,18 @@
   "outputDirectory": ".",
   "framework": null,
   "rewrites": [
-    { "source": "/mcp", "destination": "/api/mcp" }
+    { "source": "/mcp", "destination": "/api/mcp" },
+    { "source": "/health", "destination": "/api/health" }
   ],
   "functions": {
     "api/mcp.ts": {
       "maxDuration": 60
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/health",
+      "schedule": "0 8 * * *"
+    }
+  ]
 }

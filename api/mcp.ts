@@ -1,19 +1,74 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../src/index.js";
+import {
+  getDb,
+  resolveUser,
+  logCall,
+  inferProvider,
+  countEmails,
+} from "../src/db.js";
 
 // ---------------------------------------------------------------------------
-// Auth
+// Auth — per-user token (DB) with shared token fallback
 // ---------------------------------------------------------------------------
 
-function checkAuth(req: VercelRequest): boolean {
-  const token = process.env.WL_MCP_TOKEN;
-  if (!token) return false;
+interface AuthResult {
+  authenticated: boolean;
+  userId: string | null;
+  token: string;
+}
 
+async function authenticate(req: VercelRequest): Promise<AuthResult> {
   const header = req.headers.authorization;
-  if (!header) return false;
+  if (!header?.startsWith("Bearer ")) {
+    return { authenticated: false, userId: null, token: "" };
+  }
 
-  return header === `Bearer ${token}`;
+  const token = header.slice(7);
+
+  // Try per-user token from DB
+  const db = getDb();
+  if (db) {
+    try {
+      const user = await resolveUser(db, token);
+      if (user) {
+        return { authenticated: true, userId: user.id, token };
+      }
+    } catch {
+      // DB unavailable — fall through to shared token
+    }
+  }
+
+  // Fall back to shared token
+  const sharedToken = process.env.WL_MCP_TOKEN;
+  if (sharedToken && token === sharedToken) {
+    return { authenticated: true, userId: null, token };
+  }
+
+  return { authenticated: false, userId: null, token };
+}
+
+// ---------------------------------------------------------------------------
+// Extract tool call info from MCP JSON-RPC request
+// ---------------------------------------------------------------------------
+
+function extractToolCall(body: unknown): {
+  tool: string;
+  args: Record<string, unknown>;
+} | null {
+  if (!body || typeof body !== "object") return null;
+  const obj = body as Record<string, unknown>;
+
+  if (obj.method !== "tools/call") return null;
+
+  const params = obj.params as Record<string, unknown> | undefined;
+  if (!params?.name || typeof params.name !== "string") return null;
+
+  return {
+    tool: params.name,
+    args: (params.arguments as Record<string, unknown>) ?? {},
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +106,8 @@ export default async function handler(
   }
 
   // Auth check on all non-GET/OPTIONS requests
-  if (!checkAuth(req)) {
+  const auth = await authenticate(req);
+  if (!auth.authenticated) {
     return res.status(401).json({
       jsonrpc: "2.0",
       error: { code: -32000, message: "Unauthorized" },
@@ -59,6 +115,9 @@ export default async function handler(
   }
 
   if (req.method === "POST") {
+    const start = Date.now();
+    const toolCall = extractToolCall(req.body);
+
     try {
       const server = createServer();
 
@@ -71,7 +130,38 @@ export default async function handler(
 
       // Pass pre-parsed body from Vercel
       await transport.handleRequest(req, res, req.body);
+
+      // Log tool calls to DB (non-blocking, best-effort)
+      if (toolCall) {
+        const db = getDb();
+        if (db) {
+          await logCall(db, auth.userId, {
+            tool: toolCall.tool,
+            provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
+            email_count: countEmails(toolCall.args),
+            credits_used: countEmails(toolCall.args), // approximate: 1 credit per email
+            status: "success",
+            duration_ms: Date.now() - start,
+          }).catch(() => {});
+        }
+      }
     } catch (err) {
+      // Log failed tool calls
+      if (toolCall) {
+        const db = getDb();
+        if (db) {
+          await logCall(db, auth.userId, {
+            tool: toolCall.tool,
+            provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
+            email_count: countEmails(toolCall.args),
+            credits_used: 0,
+            status: "error",
+            error_message: err instanceof Error ? err.message : String(err),
+            duration_ms: Date.now() - start,
+          }).catch(() => {});
+        }
+      }
+
       if (!res.headersSent) {
         return res.status(500).json({
           jsonrpc: "2.0",
