@@ -122,6 +122,27 @@ async function getCredits(): Promise<{ credits: Record<string, unknown> }> {
   return { credits: json.data.credits };
 }
 
+function extractAvailableCredits(
+  credits: Record<string, unknown>
+): number | null {
+  for (const key of ["available", "remaining", "balance"]) {
+    if (typeof credits[key] === "number") return credits[key] as number;
+  }
+  return null;
+}
+
+function isCreditExhausted(errorMsg: string): boolean {
+  const lower = errorMsg.toLowerCase();
+  return (
+    lower.includes("insufficient credit") ||
+    lower.includes("no credits") ||
+    lower.includes("out of credit") ||
+    lower.includes("credits exhausted") ||
+    lower.includes("credit limit exceeded") ||
+    lower.includes("clearout api 402")
+  );
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server
 // ---------------------------------------------------------------------------
@@ -151,17 +172,44 @@ export function createServer(): McpServer {
       if (emails.length === 1) {
         try {
           const result = await verifyEmail(emails[0]);
+
+          // Fetch credit balance (non-fatal)
+          let creditsRemaining: Record<string, unknown> | null = null;
+          try {
+            const { credits } = await getCredits();
+            creditsRemaining = credits;
+          } catch {
+            // best-effort
+          }
+
+          const response = {
+            ...result,
+            _credits_used: 1,
+            _credits_remaining: creditsRemaining,
+          };
+
           return {
             content: [
-              { type: "text" as const, text: JSON.stringify(result, null, 2) },
+              { type: "text" as const, text: JSON.stringify(response, null, 2) },
             ],
           };
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
           return {
             content: [
               {
                 type: "text" as const,
-                text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+                text: isCreditExhausted(msg)
+                  ? JSON.stringify(
+                      {
+                        error:
+                          "Clearout credits exhausted. Purchase more at clearout.io to continue.",
+                        credits_used: 0,
+                      },
+                      null,
+                      2
+                    )
+                  : `Error: ${msg}`,
               },
             ],
             isError: true,
@@ -169,23 +217,62 @@ export function createServer(): McpServer {
         }
       }
 
-      // Multiple emails — sequential with rate limit awareness
+      // Multiple emails — pre-flight credit check, then sequential
+      let preflightCredits: Record<string, unknown> | null = null;
+      try {
+        const { credits } = await getCredits();
+        preflightCredits = credits;
+        const avail = extractAvailableCredits(credits);
+        if (avail !== null && avail < emails.length) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    error: `Insufficient credits. You have ${avail} but requested ${emails.length} validations.`,
+                    credits_remaining: credits,
+                    suggestion:
+                      avail > 0
+                        ? `Reduce batch to ${avail} emails or purchase more credits.`
+                        : "Purchase more credits at clearout.io to continue.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+      } catch {
+        // Pre-flight is best-effort — continue without it
+      }
+
       const results: Array<
         ClearoutVerifyResult | { email: string; error: string }
       > = [];
       let rateLimited = false;
+      let creditExhausted = false;
+      let creditsUsed = 0;
 
       for (let i = 0; i < emails.length; i++) {
         const addr = emails[i];
 
-        if (rateLimited) {
-          results.push({ email: addr, error: "Skipped — rate limited" });
+        if (rateLimited || creditExhausted) {
+          results.push({
+            email: addr,
+            error: creditExhausted
+              ? "Skipped — credits exhausted"
+              : "Skipped — rate limited",
+          });
           continue;
         }
 
         try {
           const result = await verifyEmail(addr);
           results.push(result);
+          creditsUsed++;
 
           if (
             result._rate_limit_remaining !== undefined &&
@@ -200,7 +287,13 @@ export function createServer(): McpServer {
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
+          if (isCreditExhausted(msg)) {
+            creditExhausted = true;
+            results.push({ email: addr, error: "Credits exhausted" });
+          } else if (
+            msg.includes("429") ||
+            msg.toLowerCase().includes("rate")
+          ) {
             rateLimited = true;
             results.push({ email: addr, error: "Rate limited" });
           } else {
@@ -209,11 +302,23 @@ export function createServer(): McpServer {
         }
       }
 
+      // Post-flight: fetch current credit balance
+      let creditsRemaining: Record<string, unknown> | null = null;
+      try {
+        const { credits } = await getCredits();
+        creditsRemaining = credits;
+      } catch {
+        // non-fatal
+      }
+
       const summary = {
         total: emails.length,
         completed: results.filter((r) => "status" in r).length,
         errors: results.filter((r) => "error" in r).length,
+        credits_used: creditsUsed,
+        credits_remaining: creditsRemaining,
         rate_limited: rateLimited,
+        credit_exhausted: creditExhausted,
         results,
       };
 
