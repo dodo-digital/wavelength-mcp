@@ -490,11 +490,68 @@ async function zbBulkResults(fileId: string): Promise<string> {
 // MCP Server
 // ---------------------------------------------------------------------------
 
-export function createServer(): McpServer {
+export interface ServerContext {
+  onToolCall?: (entry: {
+    tool: string;
+    provider?: string;
+    email_count: number;
+    credits_used: number;
+    status: "success" | "error" | "partial";
+    error_message?: string;
+    duration_ms: number;
+  }) => Promise<void>;
+}
+
+export function createServer(ctx?: ServerContext): McpServer {
   const server = new McpServer({
     name: "wavelength",
     version: "1.0.0",
   });
+
+  // Wrap a tool handler to log actual credits from its response
+  function tracked<T>(
+    tool: string,
+    meta: {
+      provider: string | null | ((args: T) => string | null);
+      emailCount: (args: T) => number;
+    },
+    handler: (args: T, extra: any) => Promise<any>
+  ): (args: T, extra: any) => Promise<any> {
+    return async (args: T, extra: any) => {
+      const start = Date.now();
+      const result = await handler(args, extra);
+
+      if (ctx?.onToolCall) {
+        let creditsUsed = 0;
+        try {
+          const text = result.content?.[0]?.text;
+          if (text) {
+            const parsed = JSON.parse(text);
+            creditsUsed = parsed.credits_used ?? parsed._credits_used ?? 0;
+          }
+        } catch {}
+
+        const provider =
+          typeof meta.provider === "function"
+            ? meta.provider(args)
+            : meta.provider;
+
+        await ctx.onToolCall({
+          tool,
+          provider: provider ?? undefined,
+          email_count: meta.emailCount(args),
+          credits_used: creditsUsed,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError
+            ? result.content?.[0]?.text?.slice(0, 500)
+            : undefined,
+          duration_ms: Date.now() - start,
+        }).catch(() => {});
+      }
+
+      return result;
+    };
+  }
 
   // -- validate_email --------------------------------------------------------
   server.tool(
@@ -508,6 +565,7 @@ export function createServer(): McpServer {
         ])
         .describe("A single email address or array of email addresses"),
     },
+    tracked("validate_email", { provider: "clearout", emailCount: ({ email }: any) => Array.isArray(email) ? email.length : 1 },
     async ({ email }) => {
       const emails = Array.isArray(email) ? email : [email];
 
@@ -670,7 +728,7 @@ export function createServer(): McpServer {
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
-    }
+    })
   );
 
   // -- zb_validate_email -----------------------------------------------------
@@ -685,6 +743,7 @@ export function createServer(): McpServer {
         ])
         .describe("A single email address or array of email addresses"),
     },
+    tracked("zb_validate_email", { provider: "zerobounce", emailCount: ({ email }: any) => Array.isArray(email) ? email.length : 1 },
     async ({ email }) => {
       const emails = Array.isArray(email) ? email : [email];
 
@@ -838,7 +897,7 @@ export function createServer(): McpServer {
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
-    }
+    })
   );
 
   // -- bulk_validate ---------------------------------------------------------
@@ -855,6 +914,7 @@ export function createServer(): McpServer {
         .max(10000)
         .describe("Array of email addresses to validate"),
     },
+    tracked("bulk_validate", { provider: ({ provider }: any) => provider, emailCount: ({ emails }: any) => emails.length },
     async ({ provider, emails }) => {
       try {
         const jobId =
@@ -891,7 +951,7 @@ export function createServer(): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- bulk_status ----------------------------------------------------------
@@ -904,6 +964,7 @@ export function createServer(): McpServer {
         .describe("Which provider the job was submitted to"),
       job_id: z.string().describe("The job_id returned from bulk_validate"),
     },
+    tracked("bulk_status", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
       try {
         let status: Record<string, unknown>;
@@ -955,7 +1016,7 @@ export function createServer(): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- bulk_results ---------------------------------------------------------
@@ -968,6 +1029,7 @@ export function createServer(): McpServer {
         .describe("Which provider the job was submitted to"),
       job_id: z.string().describe("The job_id returned from bulk_validate"),
     },
+    tracked("bulk_results", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
       try {
         const csvText =
@@ -1026,7 +1088,7 @@ export function createServer(): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- check_credits ---------------------------------------------------------
@@ -1034,6 +1096,7 @@ export function createServer(): McpServer {
     "check_credits",
     "Check remaining email verification credits for all providers (Clearout and ZeroBounce). Costs 0 credits.",
     {},
+    tracked("check_credits", { provider: null, emailCount: () => 0 },
     async () => {
       const report: Record<string, unknown> = {};
 
@@ -1065,7 +1128,7 @@ export function createServer(): McpServer {
           },
         ],
       };
-    }
+    })
   );
 
   return server;

@@ -1,13 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../src/index.js";
-import {
-  getSql,
-  resolveUser,
-  logCall,
-  inferProvider,
-  countEmails,
-} from "../src/db.js";
+import { getSql, resolveUser, logCall } from "../src/db.js";
 
 // ---------------------------------------------------------------------------
 // Auth — per-user token (DB) with shared token fallback
@@ -47,28 +41,6 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
   }
 
   return { authenticated: false, userId: null, token };
-}
-
-// ---------------------------------------------------------------------------
-// Extract tool call info from MCP JSON-RPC request
-// ---------------------------------------------------------------------------
-
-function extractToolCall(body: unknown): {
-  tool: string;
-  args: Record<string, unknown>;
-} | null {
-  if (!body || typeof body !== "object") return null;
-  const obj = body as Record<string, unknown>;
-
-  if (obj.method !== "tools/call") return null;
-
-  const params = obj.params as Record<string, unknown> | undefined;
-  if (!params?.name || typeof params.name !== "string") return null;
-
-  return {
-    tool: params.name,
-    args: (params.arguments as Record<string, unknown>) ?? {},
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -115,11 +87,16 @@ export default async function handler(
   }
 
   if (req.method === "POST") {
-    const start = Date.now();
-    const toolCall = extractToolCall(req.body);
-
     try {
-      const server = createServer();
+      const sql = getSql();
+
+      const server = createServer({
+        onToolCall: sql
+          ? async (entry) => {
+              await logCall(sql, auth.userId, entry).catch(() => {});
+            }
+          : undefined,
+      });
 
       // Stateless: new transport per request (no session persistence needed)
       const transport = new StreamableHTTPServerTransport({
@@ -130,38 +107,7 @@ export default async function handler(
 
       // Pass pre-parsed body from Vercel
       await transport.handleRequest(req, res, req.body);
-
-      // Log tool calls to DB (non-blocking, best-effort)
-      if (toolCall) {
-        const sql = getSql();
-        if (sql) {
-          await logCall(sql, auth.userId, {
-            tool: toolCall.tool,
-            provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
-            email_count: countEmails(toolCall.args),
-            credits_used: countEmails(toolCall.args), // approximate: 1 credit per email
-            status: "success",
-            duration_ms: Date.now() - start,
-          }).catch(() => {});
-        }
-      }
     } catch (err) {
-      // Log failed tool calls
-      if (toolCall) {
-        const sql = getSql();
-        if (sql) {
-          await logCall(sql, auth.userId, {
-            tool: toolCall.tool,
-            provider: inferProvider(toolCall.tool, toolCall.args) ?? undefined,
-            email_count: countEmails(toolCall.args),
-            credits_used: 0,
-            status: "error",
-            error_message: err instanceof Error ? err.message : String(err),
-            duration_ms: Date.now() - start,
-          }).catch(() => {});
-        }
-      }
-
       if (!res.headersSent) {
         return res.status(500).json({
           jsonrpc: "2.0",
