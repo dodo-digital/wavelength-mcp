@@ -19,10 +19,9 @@ function extractToken(req: VercelRequest): string | null {
   const header = req.headers.authorization;
   if (header?.startsWith("Bearer ")) return header.slice(7);
 
-  // 2. URL path: /mcp/<token> (Cowork custom connector)
-  const url = req.url ?? "";
-  const match = url.match(/^\/mcp\/([A-Za-z0-9_\-]{20,})(?:\?|$)/);
-  if (match) return match[1];
+  // 2. Query param: /api/mcp?token=<token> (Cowork custom connector)
+  const token = req.query?.token;
+  if (typeof token === "string" && token.length >= 20) return token;
 
   return null;
 }
