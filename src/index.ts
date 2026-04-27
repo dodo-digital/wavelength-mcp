@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { getSql } from "./db.js";
 
 // ---------------------------------------------------------------------------
 // Clearout API client
@@ -1231,6 +1232,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         .optional()
         .describe("Max results to return (default 100)"),
     },
+    tracked("reply_list_sequences", { provider: "reply", emailCount: () => 0 },
     async ({ status, top }) => {
       try {
         const params = new URLSearchParams();
@@ -1268,7 +1270,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- reply_get_sequence -----------------------------------------------------
@@ -1278,6 +1280,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     {
       sequence_id: z.number().describe("The sequence/campaign ID"),
     },
+    tracked("reply_get_sequence", { provider: "reply", emailCount: () => 0 },
     async ({ sequence_id }) => {
       try {
         const data = await replyGet(`/v2/campaigns/${sequence_id}`);
@@ -1297,7 +1300,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- reply_search_contact ---------------------------------------------------
@@ -1307,6 +1310,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     {
       email: z.string().email().describe("Email address to search for"),
     },
+    tracked("reply_search_contact", { provider: "reply", emailCount: () => 1 },
     async ({ email }) => {
       try {
         const data = await replyGet(
@@ -1338,7 +1342,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- reply_push_contacts ----------------------------------------------------
@@ -1369,6 +1373,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         .max(500)
         .describe("Array of contacts to add"),
     },
+    tracked("reply_push_contacts", { provider: "reply", emailCount: ({ contacts }: any) => contacts.length },
     async ({ sequence_id, contacts }) => {
       const results: Array<{
         email: string;
@@ -1450,7 +1455,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         ],
         isError: errors > 0 && added === 0,
       };
-    }
+    })
   );
 
   // -- apollo_enrich_person ---------------------------------------------------
@@ -1470,6 +1475,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         .optional()
         .describe("Company name (use with first_name + last_name)"),
     },
+    tracked("apollo_enrich_person", { provider: "apollo", emailCount: () => 1 },
     async (args) => {
       try {
         const data = (await apolloPost("/people/match", args)) as {
@@ -1505,7 +1511,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- apollo_bulk_enrich_people ----------------------------------------------
@@ -1527,6 +1533,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         .max(10)
         .describe("Array of person lookup objects (max 10)"),
     },
+    tracked("apollo_bulk_enrich_people", { provider: "apollo", emailCount: ({ details }: any) => details.length },
     async ({ details }) => {
       try {
         const data = (await apolloPost("/people/bulk_match", {
@@ -1563,7 +1570,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- apollo_enrich_org ------------------------------------------------------
@@ -1573,6 +1580,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     {
       domain: z.string().describe("Company domain (e.g. 'wavelengthequity.com')"),
     },
+    tracked("apollo_enrich_org", { provider: "apollo", emailCount: () => 0 },
     async ({ domain }) => {
       try {
         const data = await apolloPost("/organizations/enrich", { domain });
@@ -1592,7 +1600,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
-    }
+    })
   );
 
   // -- apollo_search_people ---------------------------------------------------
@@ -1618,6 +1626,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         .describe("Locations (e.g. ['United States', 'New York'])"),
       page: z.number().optional().describe("Page number (default 1)"),
     },
+    tracked("apollo_search_people", { provider: "apollo", emailCount: () => 0 },
     async (args) => {
       try {
         const data = await apolloPost("/mixed_people/api_search", {
@@ -1640,6 +1649,98 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
+    })
+  );
+
+  // -- admin_report -----------------------------------------------------------
+  server.tool(
+    "admin_report",
+    "Generate an admin report of all MCP tool usage. Shows calls by tool and provider, credits consumed, error rates, and totals. Optionally filter by time range (default: last 7 days). Also fetches live credit balances from all providers.",
+    {
+      days: z
+        .number()
+        .min(1)
+        .max(90)
+        .optional()
+        .describe("Number of days to look back (default 7)"),
+    },
+    async ({ days }) => {
+      const lookback = days ?? 7;
+      const report: Record<string, unknown> = { period_days: lookback };
+
+      // -- Live credit balances --
+      const credits: Record<string, unknown> = {};
+      try {
+        const { credits: co } = await getCredits();
+        credits.clearout = co;
+      } catch (err) {
+        credits.clearout = { error: err instanceof Error ? err.message : String(err) };
+      }
+      try {
+        const zb = await getZBCredits();
+        credits.zerobounce = { available: zb };
+      } catch (err) {
+        credits.zerobounce = { error: err instanceof Error ? err.message : String(err) };
+      }
+      report.live_credits = credits;
+
+      // -- DB usage stats --
+      const sql = getSql();
+      if (!sql) {
+        report.usage = { note: "Database not configured — no usage history available" };
+      } else {
+        try {
+          const summary = await sql`
+            SELECT
+              tool,
+              provider,
+              status,
+              count(*)::int as call_count,
+              coalesce(sum(email_count), 0)::int as total_emails,
+              coalesce(sum(credits_used), 0)::int as total_credits,
+              coalesce(avg(duration_ms), 0)::int as avg_duration_ms
+            FROM wl_calls
+            WHERE created_at >= now() - make_interval(days => ${lookback})
+            GROUP BY tool, provider, status
+            ORDER BY tool, provider, status
+          `;
+
+          const totals = await sql`
+            SELECT
+              count(*)::int as total_calls,
+              coalesce(sum(email_count), 0)::int as total_emails,
+              coalesce(sum(credits_used), 0)::int as total_credits,
+              count(*) filter (where status = 'error')::int as error_count
+            FROM wl_calls
+            WHERE created_at >= now() - make_interval(days => ${lookback})
+          `;
+
+          const users = await sql`
+            SELECT u.name, count(c.id)::int as call_count
+            FROM wl_calls c
+            LEFT JOIN wl_users u ON c.user_id = u.id
+            WHERE c.created_at >= now() - make_interval(days => ${lookback})
+            GROUP BY u.name
+            ORDER BY call_count DESC
+          `;
+
+          report.usage = {
+            by_tool: summary,
+            totals: (totals as Record<string, unknown>[])[0] ?? {},
+            by_user: users,
+          };
+        } catch (err) {
+          report.usage = {
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(report, null, 2) },
+        ],
+      };
     }
   );
 
