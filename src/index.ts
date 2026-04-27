@@ -167,8 +167,8 @@ interface ZBVerifyResult {
 }
 
 function getZBKey(): string {
-  const key = process.env.ZEROBOUNCE_API_KEY;
-  if (!key) throw new Error("ZEROBOUNCE_API_KEY not set");
+  const key = process.env.ZERO_BOUNCE_API_KEY;
+  if (!key) throw new Error("ZERO_BOUNCE_API_KEY not set");
   return key;
 }
 
@@ -252,6 +252,48 @@ function isZBCreditExhausted(errorMsg: string): boolean {
     lower.includes("zerobounce api 402") ||
     lower.includes("invalid api key")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Reply.io API client
+// ---------------------------------------------------------------------------
+
+const REPLY_BASE = "https://api.reply.io";
+
+function getReplyKey(): string {
+  const key = process.env.REPLY_IO_API_KEY;
+  if (!key) throw new Error("REPLY_IO_API_KEY not set");
+  return key;
+}
+
+async function replyGet(path: string): Promise<unknown> {
+  const res = await fetch(`${REPLY_BASE}${path}`, {
+    headers: { "X-API-Key": getReplyKey() },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Reply.io API ${res.status}: ${body}`);
+  }
+  return res.json();
+}
+
+async function replyPost(
+  path: string,
+  body: Record<string, unknown>
+): Promise<{ status: number; body: unknown }> {
+  const res = await fetch(`${REPLY_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "X-API-Key": getReplyKey(),
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  return {
+    status: res.status,
+    body: text ? JSON.parse(text) : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1171,244 @@ export function createServer(ctx?: ServerContext): McpServer {
         ],
       };
     })
+  );
+
+  // -- reply_list_sequences ---------------------------------------------------
+  server.tool(
+    "reply_list_sequences",
+    "List Reply.io sequences (campaigns). Returns id, name, status, health, and creation date. Use this to find the right sequence before adding contacts. Supports filtering by status (active/paused/new).",
+    {
+      status: z
+        .enum(["active", "paused", "new"])
+        .optional()
+        .describe("Filter by sequence status"),
+      top: z
+        .number()
+        .min(1)
+        .max(1000)
+        .optional()
+        .describe("Max results to return (default 100)"),
+    },
+    async ({ status, top }) => {
+      try {
+        const params = new URLSearchParams();
+        params.set("top", String(top ?? 100));
+        if (status) params.set("status", status);
+
+        const data = (await replyGet(
+          `/v3/sequences?${params}`
+        )) as { items: unknown[]; hasMore: boolean };
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  total: data.items.length,
+                  has_more: data.hasMore,
+                  sequences: data.items,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- reply_get_sequence -----------------------------------------------------
+  server.tool(
+    "reply_get_sequence",
+    "Get detailed info about a Reply.io sequence including email steps, templates, settings, and linked email accounts. Use to review campaign content or verify before adding contacts.",
+    {
+      sequence_id: z.number().describe("The sequence/campaign ID"),
+    },
+    async ({ sequence_id }) => {
+      try {
+        const data = await replyGet(`/v2/campaigns/${sequence_id}`);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- reply_search_contact ---------------------------------------------------
+  server.tool(
+    "reply_search_contact",
+    "Look up a contact in Reply.io by email address. Returns profile details, custom fields, creation source, and which sequences they belong to.",
+    {
+      email: z.string().email().describe("Email address to search for"),
+    },
+    async ({ email }) => {
+      try {
+        const data = await replyGet(
+          `/v1/people?email=${encodeURIComponent(email)}`
+        );
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("404")) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  { found: false, email, message: "No contact found with this email" },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- reply_push_contacts ----------------------------------------------------
+  server.tool(
+    "reply_push_contacts",
+    "Add one or more contacts to a Reply.io sequence. Creates the contact if new, updates if existing, then pushes to the specified campaign. This is the primary tool for the Grata → Reply.io pipeline. Always confirm with the user before calling.",
+    {
+      sequence_id: z.number().describe("The sequence/campaign ID to add contacts to"),
+      contacts: z
+        .array(
+          z.object({
+            email: z.string().email(),
+            firstName: z.string(),
+            lastName: z.string().optional(),
+            title: z.string().optional(),
+            company: z.string().optional(),
+            city: z.string().optional(),
+            state: z.string().optional(),
+            country: z.string().optional(),
+            phone: z.string().optional(),
+            linkedInProfile: z.string().optional(),
+            customFields: z
+              .array(z.object({ key: z.string(), value: z.string() }))
+              .optional(),
+          })
+        )
+        .min(1)
+        .max(500)
+        .describe("Array of contacts to add"),
+    },
+    async ({ sequence_id, contacts }) => {
+      const results: Array<{
+        email: string;
+        status: "added" | "error";
+        error?: string;
+      }> = [];
+
+      for (let i = 0; i < contacts.length; i++) {
+        const contact = contacts[i];
+        try {
+          const payload: Record<string, unknown> = {
+            campaignId: sequence_id,
+            email: contact.email,
+            firstName: contact.firstName,
+          };
+          if (contact.lastName) payload.lastName = contact.lastName;
+          if (contact.title) payload.title = contact.title;
+          if (contact.company) payload.company = contact.company;
+          if (contact.city) payload.city = contact.city;
+          if (contact.state) payload.state = contact.state;
+          if (contact.country) payload.country = contact.country;
+          if (contact.phone) payload.phone = contact.phone;
+          if (contact.linkedInProfile)
+            payload.linkedInProfile = contact.linkedInProfile;
+          if (contact.customFields)
+            payload.customFields = contact.customFields;
+
+          const res = await replyPost(
+            "/v1/actions/addandpushtocampaign",
+            payload
+          );
+
+          if (res.status >= 200 && res.status < 300) {
+            results.push({ email: contact.email, status: "added" });
+          } else {
+            const errMsg =
+              typeof res.body === "object" && res.body !== null
+                ? JSON.stringify(res.body)
+                : String(res.body);
+            results.push({
+              email: contact.email,
+              status: "error",
+              error: `HTTP ${res.status}: ${errMsg}`,
+            });
+          }
+
+          // Small delay between requests to avoid rate limits
+          if (i < contacts.length - 1) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+        } catch (err) {
+          results.push({
+            email: contact.email,
+            status: "error",
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      const added = results.filter((r) => r.status === "added").length;
+      const errors = results.filter((r) => r.status === "error").length;
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                sequence_id,
+                total: contacts.length,
+                added,
+                errors,
+                results,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: errors > 0 && added === 0,
+      };
+    }
   );
 
   return server;
