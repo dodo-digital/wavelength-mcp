@@ -255,6 +255,48 @@ function isZBCreditExhausted(errorMsg: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Apollo API client
+// ---------------------------------------------------------------------------
+
+const APOLLO_BASE = "https://api.apollo.io/api/v1";
+
+function getApolloKey(): string {
+  const key = process.env.APOLLO_API_KEY;
+  if (!key) throw new Error("APOLLO_API_KEY not set");
+  return key;
+}
+
+async function apolloPost(
+  path: string,
+  body: Record<string, unknown>
+): Promise<unknown> {
+  const res = await fetch(`${APOLLO_BASE}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Api-Key": getApolloKey(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Apollo API ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+async function apolloGet(path: string): Promise<unknown> {
+  const res = await fetch(`${APOLLO_BASE}${path}`, {
+    headers: { "X-Api-Key": getApolloKey() },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Apollo API ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
 // Reply.io API client
 // ---------------------------------------------------------------------------
 
@@ -1408,6 +1450,196 @@ export function createServer(ctx?: ServerContext): McpServer {
         ],
         isError: errors > 0 && added === 0,
       };
+    }
+  );
+
+  // -- apollo_enrich_person ---------------------------------------------------
+  server.tool(
+    "apollo_enrich_person",
+    "Enrich a single person via Apollo. Provide an email, LinkedIn URL, or name+company combo. Returns verified email, title, LinkedIn, employment history, location, and organization data. Costs 1 Apollo credit.",
+    {
+      email: z.string().optional().describe("Email address to match"),
+      linkedin_url: z
+        .string()
+        .optional()
+        .describe("LinkedIn profile URL to match"),
+      first_name: z.string().optional().describe("First name (use with last_name + organization_name)"),
+      last_name: z.string().optional().describe("Last name (use with first_name + organization_name)"),
+      organization_name: z
+        .string()
+        .optional()
+        .describe("Company name (use with first_name + last_name)"),
+    },
+    async (args) => {
+      try {
+        const data = (await apolloPost("/people/match", args)) as {
+          person: Record<string, unknown> | null;
+        };
+        if (!data.person) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  { found: false, query: args, message: "No match found" },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data.person, null, 2) },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- apollo_bulk_enrich_people ----------------------------------------------
+  server.tool(
+    "apollo_bulk_enrich_people",
+    "Enrich up to 10 people per call via Apollo bulk match. Provide an array of lookup objects (each with email, linkedin_url, or first_name+last_name+organization_name). For batches larger than 10, call this tool multiple times. Costs 1 credit per matched person.",
+    {
+      details: z
+        .array(
+          z.object({
+            email: z.string().optional(),
+            linkedin_url: z.string().optional(),
+            first_name: z.string().optional(),
+            last_name: z.string().optional(),
+            organization_name: z.string().optional(),
+          })
+        )
+        .min(1)
+        .max(10)
+        .describe("Array of person lookup objects (max 10)"),
+    },
+    async ({ details }) => {
+      try {
+        const data = (await apolloPost("/people/bulk_match", {
+          details,
+        })) as { matches: Array<Record<string, unknown> | null> };
+
+        const matched = data.matches.filter((m) => m !== null).length;
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  total: details.length,
+                  matched,
+                  not_found: details.length - matched,
+                  matches: data.matches,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- apollo_enrich_org ------------------------------------------------------
+  server.tool(
+    "apollo_enrich_org",
+    "Enrich a company/organization via Apollo. Provide a domain to get company details including industry, size, revenue, location, and technology stack.",
+    {
+      domain: z.string().describe("Company domain (e.g. 'wavelengthequity.com')"),
+    },
+    async ({ domain }) => {
+      try {
+        const data = await apolloPost("/organizations/enrich", { domain });
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- apollo_search_people ---------------------------------------------------
+  server.tool(
+    "apollo_search_people",
+    "Search Apollo's database for people matching criteria. Use to find contacts at a company when you don't have specific names. Returns up to 25 results per page.",
+    {
+      organization_domains: z
+        .array(z.string())
+        .optional()
+        .describe("Company domains to search within"),
+      person_titles: z
+        .array(z.string())
+        .optional()
+        .describe("Job titles to filter (e.g. ['CEO', 'Founder', 'Owner'])"),
+      person_seniorities: z
+        .array(z.string())
+        .optional()
+        .describe("Seniority levels: owner, founder, c_suite, partner, vp, director, manager"),
+      person_locations: z
+        .array(z.string())
+        .optional()
+        .describe("Locations (e.g. ['United States', 'New York'])"),
+      page: z.number().optional().describe("Page number (default 1)"),
+    },
+    async (args) => {
+      try {
+        const data = await apolloPost("/mixed_people/api_search", {
+          ...args,
+          page: args.page ?? 1,
+        });
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     }
   );
 
