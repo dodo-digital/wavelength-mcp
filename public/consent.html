@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wavelength MCP — Authorize</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0a0a0a;
+      color: #e5e5e5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #171717;
+      border: 1px solid #262626;
+      border-radius: 12px;
+      padding: 2.5rem;
+      max-width: 420px;
+      width: 100%;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 0.5rem; text-align: center; }
+    .subtitle { color: #a3a3a3; font-size: 0.875rem; margin-bottom: 1.5rem; text-align: center; }
+    .scope-list {
+      background: #1c1917;
+      border: 1px solid #292524;
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .scope-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.875rem;
+      color: #d4d4d4;
+    }
+    .scope-item::before { content: "✓"; color: #4ade80; font-weight: bold; }
+    .actions { display: flex; gap: 0.75rem; }
+    .btn {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      border: none;
+      font-size: 0.9375rem;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-approve { background: #16a34a; color: #fff; }
+    .btn-approve:hover { background: #15803d; }
+    .btn-deny { background: #262626; color: #a3a3a3; border: 1px solid #404040; }
+    .btn-deny:hover { background: #333; }
+    .code-display {
+      margin-top: 1.5rem;
+      padding: 1rem;
+      background: #1c1917;
+      border: 1px solid #292524;
+      border-radius: 8px;
+      display: none;
+      text-align: center;
+    }
+    .code-display code {
+      display: block;
+      font-size: 1.1rem;
+      color: #4ade80;
+      letter-spacing: 0.05em;
+      margin: 0.5rem 0;
+      word-break: break-all;
+    }
+    .btn-copy {
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.5rem 1rem;
+      font-size: 0.8125rem;
+      cursor: pointer;
+      margin-top: 0.5rem;
+    }
+    .btn-copy:hover { background: #1d4ed8; }
+    .error {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      background: #371520;
+      border: 1px solid #5c1d33;
+      border-radius: 8px;
+      color: #f87171;
+      font-size: 0.8125rem;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Authorize Application</h1>
+    <p class="subtitle">An MCP client wants to access your Wavelength account</p>
+
+    <div class="scope-list">
+      <div class="scope-item">Use Wavelength MCP tools on your behalf</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-deny" onclick="deny()">Deny</button>
+      <button class="btn btn-approve" id="approveBtn" onclick="approve()">Approve</button>
+    </div>
+
+    <div class="code-display" id="codeDisplay">
+      <p style="font-size: 0.8125rem; color: #a3a3a3;">If the redirect didn't work, copy this code:</p>
+      <code id="authCode"></code>
+      <button class="btn-copy" onclick="copyCode()">Copy code</button>
+    </div>
+
+    <div class="error" id="error"></div>
+  </div>
+
+  <script>
+    // Parse OAuth params from URL
+    const params = new URLSearchParams(window.location.search);
+    const clientId = params.get("client_id");
+    const redirectUri = params.get("redirect_uri");
+    const state = params.get("state");
+    const scope = params.get("scope");
+    const codeChallenge = params.get("code_challenge");
+    const codeChallengeMethod = params.get("code_challenge_method");
+
+    async function approve() {
+      const btn = document.getElementById("approveBtn");
+      const errorEl = document.getElementById("error");
+      btn.disabled = true;
+      btn.textContent = "Authorizing...";
+      errorEl.style.display = "none";
+
+      try {
+        // Submit consent to Better Auth
+        const resp = await fetch("/api/auth/oauth2/consent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            accept: true,
+            clientId,
+            scope: scope || "mcp",
+            redirectUri,
+            state,
+            codeChallenge,
+            codeChallengeMethod,
+          }),
+        });
+
+        if (!resp.ok) {
+          const body = await resp.text();
+          throw new Error(body || resp.statusText);
+        }
+
+        const data = await resp.json();
+
+        if (data.redirectTo || data.url) {
+          // Try redirect
+          const target = data.redirectTo || data.url;
+          window.location.href = target;
+
+          // After short delay, show code as fallback
+          setTimeout(() => {
+            const url = new URL(target);
+            const code = url.searchParams.get("code");
+            if (code) {
+              document.getElementById("authCode").textContent = code;
+              document.getElementById("codeDisplay").style.display = "block";
+            }
+          }, 3000);
+        } else if (data.code) {
+          // Direct code response
+          document.getElementById("authCode").textContent = data.code;
+          document.getElementById("codeDisplay").style.display = "block";
+        }
+      } catch (err) {
+        errorEl.textContent = "Authorization failed: " + err.message;
+        errorEl.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Try again";
+      }
+    }
+
+    function deny() {
+      if (redirectUri) {
+        const url = new URL(redirectUri);
+        url.searchParams.set("error", "access_denied");
+        if (state) url.searchParams.set("state", state);
+        window.location.href = url.toString();
+      } else {
+        window.close();
+      }
+    }
+
+    function copyCode() {
+      const code = document.getElementById("authCode").textContent;
+      navigator.clipboard.writeText(code).then(() => {
+        const btn = document.querySelector(".btn-copy");
+        btn.textContent = "Copied!";
+        setTimeout(() => { btn.textContent = "Copy code"; }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>

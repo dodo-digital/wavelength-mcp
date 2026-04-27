@@ -1652,6 +1652,161 @@ export function createServer(ctx?: ServerContext): McpServer {
     })
   );
 
+  // -- get_skill_learnings ----------------------------------------------------
+  server.tool(
+    "get_skill_learnings",
+    "Retrieve learned adjustments for a skill. Returns all active learnings, optionally filtered by industry. Call this at the start of every skill run to load accumulated knowledge from previous runs across all users.",
+    {
+      skill: z
+        .string()
+        .describe("Skill name (e.g. 'company-processor', 'grata-search-enrichment')"),
+      industry: z
+        .string()
+        .optional()
+        .describe("Filter by industry (e.g. 'cybersecurity'). Omit to get all learnings for the skill."),
+    },
+    async ({ skill, industry }) => {
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ learnings: [], note: "Database not configured" }, null, 2),
+            },
+          ],
+        };
+      }
+
+      try {
+        let rows;
+        if (industry) {
+          rows = await sql`
+            SELECT id, skill, industry, category, content, created_by, created_at
+            FROM wl_skill_learnings
+            WHERE skill = ${skill}
+              AND (industry = ${industry} OR industry IS NULL)
+              AND is_active = true
+            ORDER BY created_at ASC
+          `;
+        } else {
+          rows = await sql`
+            SELECT id, skill, industry, category, content, created_by, created_at
+            FROM wl_skill_learnings
+            WHERE skill = ${skill}
+              AND is_active = true
+            ORDER BY created_at ASC
+          `;
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  skill,
+                  industry: industry ?? "all",
+                  count: (rows as unknown[]).length,
+                  learnings: rows,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- save_skill_learning ----------------------------------------------------
+  server.tool(
+    "save_skill_learning",
+    "Save a new learning for a skill. Learnings accumulate across runs and users — every user's Claude instance sees them. Use after calibration, when encountering schema changes, edge cases in title filtering, business model patterns, or data quality issues. Each learning should be a single, actionable insight.",
+    {
+      skill: z
+        .string()
+        .describe("Skill name (e.g. 'company-processor', 'grata-search-enrichment')"),
+      industry: z
+        .string()
+        .optional()
+        .describe("Industry this learning applies to (e.g. 'cybersecurity'). Omit for global learnings."),
+      category: z
+        .enum(["adjustment", "schema-change", "edge-case", "pattern"])
+        .default("adjustment")
+        .describe("Type of learning: adjustment (calibration), schema-change (format change), edge-case (title/role), pattern (business model)"),
+      content: z
+        .string()
+        .describe("The learning itself. Be specific and actionable. E.g. 'MSP with dedicated SOC practice = HIGH eligible, not automatic LOW'"),
+    },
+    async ({ skill, industry, category, content }) => {
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ saved: false, error: "Database not configured" }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      try {
+        const rows = await sql`
+          INSERT INTO wl_skill_learnings (skill, industry, category, content, created_by)
+          VALUES (${skill}, ${industry ?? null}, ${category}, ${content}, 'claude')
+          RETURNING id, created_at
+        `;
+
+        const row = (rows as Record<string, unknown>[])[0];
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  saved: true,
+                  id: row.id,
+                  skill,
+                  industry: industry ?? "global",
+                  category,
+                  content,
+                  created_at: row.created_at,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // -- admin_report -----------------------------------------------------------
   server.tool(
     "admin_report",

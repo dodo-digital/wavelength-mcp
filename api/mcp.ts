@@ -2,9 +2,10 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../src/index.js";
 import { getSql, resolveUser, logCall } from "../src/db.js";
+import { auth } from "../src/auth.js";
 
 // ---------------------------------------------------------------------------
-// Auth — per-user token (DB) with shared token fallback
+// Auth — Better Auth OAuth → per-user DB token → shared token fallback
 // ---------------------------------------------------------------------------
 
 interface AuthResult {
@@ -28,16 +29,58 @@ function extractToken(req: VercelRequest): string | null {
 
 async function authenticate(req: VercelRequest): Promise<AuthResult> {
   const token = extractToken(req);
+  const hasBearer = !!token;
+
+  // 1. Try Better Auth session/token validation
+  if (token) {
+    try {
+      const session = await auth.api.getSession({
+        headers: new Headers({ authorization: `Bearer ${token}` }),
+      });
+      if (session?.user?.id) {
+        // Look up or create wl_users entry by auth_user_id
+        const sql = getSql();
+        let userId: string | null = null;
+        if (sql) {
+          try {
+            const rows = (await sql`
+              SELECT id FROM wl_users WHERE auth_user_id = ${session.user.id} LIMIT 1
+            `) as { id: string }[];
+            if (rows.length > 0) {
+              userId = rows[0].id;
+            } else {
+              // Auto-create wl_users entry for new OAuth users
+              const inserted = (await sql`
+                INSERT INTO wl_users (name, token, auth_user_id, is_active)
+                VALUES (${session.user.name || session.user.email || "oauth-user"}, ${`oauth-${session.user.id}`}, ${session.user.id}, true)
+                RETURNING id
+              `) as { id: string }[];
+              userId = inserted[0]?.id ?? null;
+            }
+          } catch {
+            // DB issue — auth still valid, proceed without user tracking
+          }
+        }
+        console.log("[mcp-auth]", { method: "better-auth", hasBearer, userId });
+        return { authenticated: true, userId, token };
+      }
+    } catch {
+      // Better Auth validation failed — fall through to legacy auth
+    }
+  }
+
   if (!token) {
+    console.log("[mcp-auth]", { method: "none", hasBearer: false });
     return { authenticated: false, userId: null, token: "" };
   }
 
-  // Try per-user token from DB
+  // 2. Try per-user token from DB (legacy)
   const sql = getSql();
   if (sql) {
     try {
       const user = await resolveUser(sql, token);
       if (user) {
+        console.log("[mcp-auth]", { method: "db-token", hasBearer, userId: user.id });
         return { authenticated: true, userId: user.id, token };
       }
     } catch {
@@ -45,18 +88,23 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
     }
   }
 
-  // Fall back to shared token
+  // 3. Fall back to shared token
   const sharedToken = process.env.WL_MCP_TOKEN;
   if (sharedToken && token === sharedToken) {
+    console.log("[mcp-auth]", { method: "shared-token", hasBearer });
     return { authenticated: true, userId: null, token };
   }
 
+  console.log("[mcp-auth]", { method: "rejected", hasBearer });
   return { authenticated: false, userId: null, token };
 }
 
 // ---------------------------------------------------------------------------
 // Vercel serverless handler
 // ---------------------------------------------------------------------------
+
+const RESOURCE_METADATA_URL =
+  "https://wavelength-mcp.vercel.app/.well-known/oauth-protected-resource";
 
 export default async function handler(
   req: VercelRequest,
@@ -89,11 +137,19 @@ export default async function handler(
   }
 
   // Auth check on all non-GET/OPTIONS requests
-  const auth = await authenticate(req);
-  if (!auth.authenticated) {
+  const authResult = await authenticate(req);
+  if (!authResult.authenticated) {
+    res.setHeader(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${RESOURCE_METADATA_URL}"`
+    );
     return res.status(401).json({
       jsonrpc: "2.0",
-      error: { code: -32000, message: "Unauthorized" },
+      error: {
+        code: -32000,
+        message:
+          "Authorization required. Connect with OAuth to authenticate.",
+      },
     });
   }
 
@@ -104,7 +160,7 @@ export default async function handler(
       const server = createServer({
         onToolCall: sql
           ? async (entry) => {
-              await logCall(sql, auth.userId, entry).catch(() => {});
+              await logCall(sql, authResult.userId, entry).catch(() => {});
             }
           : undefined,
       });

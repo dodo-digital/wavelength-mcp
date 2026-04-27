@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wavelength MCP — Sign In</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0a0a0a;
+      color: #e5e5e5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #171717;
+      border: 1px solid #262626;
+      border-radius: 12px;
+      padding: 2.5rem;
+      max-width: 400px;
+      width: 100%;
+      text-align: center;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
+    .subtitle { color: #a3a3a3; font-size: 0.875rem; margin-bottom: 2rem; }
+    .btn-microsoft {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.75rem 1.5rem;
+      font-size: 0.9375rem;
+      cursor: pointer;
+      width: 100%;
+      justify-content: center;
+      transition: background 0.15s;
+    }
+    .btn-microsoft:hover { background: #1d4ed8; }
+    .btn-microsoft:disabled { opacity: 0.6; cursor: not-allowed; }
+    .btn-microsoft svg { width: 20px; height: 20px; }
+    .error {
+      margin-top: 1.5rem;
+      padding: 0.75rem;
+      background: #371520;
+      border: 1px solid #5c1d33;
+      border-radius: 8px;
+      color: #f87171;
+      font-size: 0.8125rem;
+      display: none;
+    }
+    .fallback {
+      margin-top: 1.5rem;
+      padding: 0.75rem;
+      background: #1c1917;
+      border: 1px solid #292524;
+      border-radius: 8px;
+      font-size: 0.8125rem;
+      color: #a3a3a3;
+      display: none;
+      word-break: break-all;
+    }
+    .fallback a { color: #60a5fa; }
+    .not-configured {
+      color: #fbbf24;
+      font-size: 0.875rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Wavelength MCP</h1>
+    <p class="subtitle">Sign in to connect your MCP client</p>
+
+    <button class="btn-microsoft" id="msBtn" onclick="signIn()">
+      <svg viewBox="0 0 21 21" fill="none"><rect x="1" y="1" width="9" height="9" fill="#f25022"/><rect x="11" y="1" width="9" height="9" fill="#7fba00"/><rect x="1" y="11" width="9" height="9" fill="#00a4ef"/><rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>
+      Sign in with Microsoft
+    </button>
+
+    <div class="error" id="error"></div>
+    <div class="fallback" id="fallback"></div>
+  </div>
+
+  <script>
+    async function signIn() {
+      const btn = document.getElementById("msBtn");
+      const errorEl = document.getElementById("error");
+      const fallbackEl = document.getElementById("fallback");
+      btn.disabled = true;
+      btn.textContent = "Redirecting...";
+      errorEl.style.display = "none";
+      fallbackEl.style.display = "none";
+
+      try {
+        const callbackURL = window.location.href;
+        const resp = await fetch("/api/auth/sign-in/social", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider: "microsoft", callbackURL }),
+        });
+
+        if (!resp.ok) {
+          const body = await resp.text();
+          if (resp.status === 500 && body.includes("not configured")) {
+            errorEl.textContent = "Microsoft login is not configured yet. Contact an admin to set up Azure AD credentials.";
+            errorEl.classList.add("not-configured");
+          } else {
+            errorEl.textContent = "Sign-in failed: " + (body || resp.statusText);
+          }
+          errorEl.style.display = "block";
+          btn.disabled = false;
+          btn.textContent = "Try again";
+          return;
+        }
+
+        const data = await resp.json();
+        if (data.url) {
+          window.location.href = data.url;
+        } else {
+          throw new Error("No redirect URL returned");
+        }
+      } catch (err) {
+        errorEl.textContent = "Something went wrong: " + err.message;
+        errorEl.style.display = "block";
+        fallbackEl.innerHTML = "Having trouble? Try opening the authorization URL manually in your browser.";
+        fallbackEl.style.display = "block";
+        btn.disabled = false;
+        btn.textContent = "Try again";
+      }
+    }
+  </script>
+</body>
+</html>

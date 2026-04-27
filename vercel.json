@@ -1,12 +1,16 @@
 {
   "buildCommand": "npm run build",
-  "installCommand": "npm install",
+  "installCommand": "npm install --legacy-peer-deps",
   "outputDirectory": ".",
   "framework": null,
   "rewrites": [
     { "source": "/mcp/:token", "destination": "/api/mcp" },
     { "source": "/mcp", "destination": "/api/mcp" },
-    { "source": "/health", "destination": "/api/health" }
+    { "source": "/health", "destination": "/api/health" },
+    { "source": "/.well-known/oauth-protected-resource", "destination": "/api/well-known/oauth-protected-resource" },
+    { "source": "/.well-known/oauth-authorization-server", "destination": "/api/well-known/oauth-authorization-server" },
+    { "source": "/sign-in", "destination": "/public/sign-in.html" },
+    { "source": "/consent", "destination": "/public/consent.html" }
   ],
   "functions": {
     "api/mcp.ts": {
