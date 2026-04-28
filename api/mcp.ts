@@ -19,9 +19,12 @@ function extractToken(req: VercelRequest): string | null {
   const header = req.headers.authorization;
   if (header?.startsWith("Bearer ")) return header.slice(7);
 
-  // 2. Query param: /api/mcp?token=<token> (Cowork custom connector)
+  // 2. Query param (deprecated — migrate to Bearer header)
   const token = req.query?.token;
-  if (typeof token === "string" && token.length >= 20) return token;
+  if (typeof token === "string" && token.length >= 20) {
+    console.warn("[mcp-auth] DEPRECATED: token passed via query param. Use Authorization: Bearer header instead.");
+    return token;
+  }
 
   return null;
 }
@@ -150,6 +153,32 @@ export default async function handler(
           "Authorization required. Connect with OAuth to authenticate.",
       },
     });
+  }
+
+  // Rate limiting — 100 tool calls per hour per user (DB-backed)
+  if (authResult.userId) {
+    const sql = getSql();
+    if (sql) {
+      try {
+        const rows = (await sql`
+          SELECT count(*)::int AS cnt FROM wl_calls
+          WHERE user_id = ${authResult.userId}
+            AND created_at > now() - interval '1 hour'
+        `) as { cnt: number }[];
+        if (rows[0]?.cnt >= 100) {
+          return res.status(429).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "Rate limit exceeded. Max 100 tool calls per hour.",
+            },
+          });
+        }
+      } catch (err) {
+        console.error("[mcp] Rate limit check failed:", err);
+        // Don't block on rate limit check failure
+      }
+    }
   }
 
   if (req.method === "POST") {

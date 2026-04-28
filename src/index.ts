@@ -1,580 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { getSql } from "./db.js";
-
-// ---------------------------------------------------------------------------
-// Clearout API client
-// ---------------------------------------------------------------------------
-
-const CLEAROUT_BASE = "https://api.clearout.io/v2";
-
-interface ClearoutVerifyResult {
-  email_address: string;
-  safe_to_send: string;
-  status: string;
-  sub_status?: { code: number; desc: string };
-  disposable: string;
-  free: string;
-  role: string;
-  gibberish: string;
-  bounce_type: string;
-  time_taken?: number;
-  _schema_warning?: string;
-  _rate_limit_remaining?: number;
-}
-
-interface ClearoutResponse {
-  status: string;
-  data?: ClearoutVerifyResult;
-  error?: { code: number; message: string };
-}
-
-interface ClearoutCreditResponse {
-  status: string;
-  data?: { credits: Record<string, unknown> };
-  error?: { code: number; message: string };
-}
-
-function getClearoutKey(): string {
-  const key = process.env.CLEAROUT_API_KEY;
-  if (!key) throw new Error("CLEAROUT_API_KEY not set");
-  return key;
-}
-
-function validateResponseShape(data: Record<string, unknown>): string | null {
-  const required = ["email_address", "status", "safe_to_send"];
-  const missing = required.filter((k) => !(k in data));
-  if (missing.length > 0) {
-    return `Clearout response missing fields: ${missing.join(", ")}. API may have changed.`;
-  }
-  return null;
-}
-
-async function verifyEmail(email: string): Promise<ClearoutVerifyResult> {
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/instant`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer:${getClearoutKey()}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ email, timeout: 130000 }),
-  });
-
-  const rateLimitRemaining = res.headers.get("x-ratelimit-remaining");
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Clearout API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as ClearoutResponse;
-
-  if (json.status === "error" || !json.data) {
-    throw new Error(
-      `Clearout error: ${json.error?.message ?? "Unknown error"}`
-    );
-  }
-
-  const warning = validateResponseShape(
-    json.data as unknown as Record<string, unknown>
-  );
-  const result: ClearoutVerifyResult = {
-    email_address: json.data.email_address,
-    safe_to_send: json.data.safe_to_send,
-    status: json.data.status,
-    sub_status: json.data.sub_status,
-    disposable: json.data.disposable,
-    free: json.data.free,
-    role: json.data.role,
-    gibberish: json.data.gibberish,
-    bounce_type: json.data.bounce_type,
-    time_taken: json.data.time_taken,
-  };
-
-  if (warning) result._schema_warning = warning;
-  if (rateLimitRemaining !== null) {
-    result._rate_limit_remaining = parseInt(rateLimitRemaining, 10);
-  }
-
-  return result;
-}
-
-async function getCredits(): Promise<{ credits: Record<string, unknown> }> {
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/getcredits`, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer:${getClearoutKey()}`,
-    },
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Clearout API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as ClearoutCreditResponse;
-
-  if (json.status === "error" || !json.data) {
-    throw new Error(
-      `Clearout error: ${json.error?.message ?? "Unknown error"}`
-    );
-  }
-
-  return { credits: json.data.credits };
-}
-
-function extractAvailableCredits(
-  credits: Record<string, unknown>
-): number | null {
-  for (const key of ["available", "remaining", "balance"]) {
-    if (typeof credits[key] === "number") return credits[key] as number;
-  }
-  return null;
-}
-
-function isCreditExhausted(errorMsg: string): boolean {
-  const lower = errorMsg.toLowerCase();
-  return (
-    lower.includes("insufficient credit") ||
-    lower.includes("no credits") ||
-    lower.includes("out of credit") ||
-    lower.includes("credits exhausted") ||
-    lower.includes("credit limit exceeded") ||
-    lower.includes("clearout api 402")
-  );
-}
-
-// ---------------------------------------------------------------------------
-// ZeroBounce API client
-// ---------------------------------------------------------------------------
-
-const ZEROBOUNCE_BASE = "https://api.zerobounce.net/v2";
-
-interface ZBVerifyResult {
-  address: string;
-  status: string;
-  sub_status: string;
-  free_email: boolean;
-  did_you_mean: string | null;
-  domain: string | null;
-  domain_age_days: string;
-  smtp_provider: string;
-  mx_found: string;
-  mx_record: string;
-  firstname: string;
-  lastname: string;
-  gender: string;
-  _schema_warning?: string;
-}
-
-function getZBKey(): string {
-  const key = process.env.ZERO_BOUNCE_API_KEY;
-  if (!key) throw new Error("ZERO_BOUNCE_API_KEY not set");
-  return key;
-}
-
-function validateZBResponseShape(
-  data: Record<string, unknown>
-): string | null {
-  const required = ["address", "status"];
-  const missing = required.filter((k) => !(k in data));
-  if (missing.length > 0) {
-    return `ZeroBounce response missing fields: ${missing.join(", ")}. API may have changed.`;
-  }
-  return null;
-}
-
-async function zbVerifyEmail(email: string): Promise<ZBVerifyResult> {
-  const params = new URLSearchParams({
-    api_key: getZBKey(),
-    email,
-    ip_address: "",
-  });
-
-  const res = await fetch(`${ZEROBOUNCE_BASE}/validate?${params}`);
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`ZeroBounce API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as Record<string, unknown>;
-
-  if (json.error) {
-    throw new Error(`ZeroBounce error: ${String(json.error)}`);
-  }
-
-  const warning = validateZBResponseShape(json);
-  const result: ZBVerifyResult = {
-    address: String(json.address ?? ""),
-    status: String(json.status ?? ""),
-    sub_status: String(json.sub_status ?? ""),
-    free_email: Boolean(json.free_email),
-    did_you_mean: (json.did_you_mean as string | null) ?? null,
-    domain: (json.domain as string | null) ?? null,
-    domain_age_days: String(json.domain_age_days ?? ""),
-    smtp_provider: String(json.smtp_provider ?? ""),
-    mx_found: String(json.mx_found ?? ""),
-    mx_record: String(json.mx_record ?? ""),
-    firstname: String(json.firstname ?? ""),
-    lastname: String(json.lastname ?? ""),
-    gender: String(json.gender ?? ""),
-  };
-
-  if (warning) result._schema_warning = warning;
-
-  return result;
-}
-
-async function getZBCredits(): Promise<number> {
-  const params = new URLSearchParams({ api_key: getZBKey() });
-  const res = await fetch(`${ZEROBOUNCE_BASE}/getcredits?${params}`);
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`ZeroBounce API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as { Credits: number };
-
-  if (json.Credits === -1) {
-    throw new Error("ZeroBounce: Invalid API key");
-  }
-
-  return json.Credits;
-}
-
-function isZBCreditExhausted(errorMsg: string): boolean {
-  const lower = errorMsg.toLowerCase();
-  return (
-    lower.includes("insufficient credit") ||
-    lower.includes("no credits") ||
-    lower.includes("credits exhausted") ||
-    lower.includes("zerobounce api 402") ||
-    lower.includes("invalid api key")
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Apollo API client
-// ---------------------------------------------------------------------------
-
-const APOLLO_BASE = "https://api.apollo.io/api/v1";
-
-function getApolloKey(): string {
-  const key = process.env.APOLLO_API_KEY;
-  if (!key) throw new Error("APOLLO_API_KEY not set");
-  return key;
-}
-
-async function apolloPost(
-  path: string,
-  body: Record<string, unknown>
-): Promise<unknown> {
-  const res = await fetch(`${APOLLO_BASE}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Api-Key": getApolloKey(),
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Apollo API ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-async function apolloGet(path: string): Promise<unknown> {
-  const res = await fetch(`${APOLLO_BASE}${path}`, {
-    headers: { "X-Api-Key": getApolloKey() },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Apollo API ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-// ---------------------------------------------------------------------------
-// Reply.io API client
-// ---------------------------------------------------------------------------
-
-const REPLY_BASE = "https://api.reply.io";
-
-function getReplyKey(): string {
-  const key = process.env.REPLY_IO_API_KEY;
-  if (!key) throw new Error("REPLY_IO_API_KEY not set");
-  return key;
-}
-
-async function replyGet(path: string): Promise<unknown> {
-  const res = await fetch(`${REPLY_BASE}${path}`, {
-    headers: { "X-API-Key": getReplyKey() },
-  });
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Reply.io API ${res.status}: ${body}`);
-  }
-  return res.json();
-}
-
-async function replyPost(
-  path: string,
-  body: Record<string, unknown>
-): Promise<{ status: number; body: unknown }> {
-  const res = await fetch(`${REPLY_BASE}${path}`, {
-    method: "POST",
-    headers: {
-      "X-API-Key": getReplyKey(),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let parsed: unknown = null;
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      parsed = text;
-    }
-  }
-  return { status: res.status, body: parsed };
-}
-
-// ---------------------------------------------------------------------------
-// Bulk validation clients
-// ---------------------------------------------------------------------------
-
-const ZEROBOUNCE_BULK_BASE = "https://bulkapi.zerobounce.net/v2";
-
-function emailsToCsv(emails: string[]): string {
-  return "email\n" + emails.join("\n");
-}
-
-function parseCsvLine(line: string): string[] {
-  const fields: string[] = [];
-  let current = "";
-  let inQuote = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (inQuote) {
-      if (ch === '"') {
-        if (line[i + 1] === '"') {
-          current += '"';
-          i++;
-        } else {
-          inQuote = false;
-        }
-      } else {
-        current += ch;
-      }
-    } else if (ch === '"') {
-      inQuote = true;
-    } else if (ch === ",") {
-      fields.push(current);
-      current = "";
-    } else {
-      current += ch;
-    }
-  }
-  fields.push(current);
-  return fields;
-}
-
-function parseCsv(csv: string): Record<string, string>[] {
-  const lines = csv.trim().split(/\r?\n/);
-  if (lines.length < 2) return [];
-
-  const headers = parseCsvLine(lines[0]).map((h) => h.trim());
-  return lines
-    .slice(1)
-    .filter((l) => l.trim())
-    .map((line) => {
-      const values = parseCsvLine(line);
-      const row: Record<string, string> = {};
-      headers.forEach((h, i) => {
-        row[h] = (values[i] ?? "").trim();
-      });
-      return row;
-    });
-}
-
-// -- Clearout bulk --
-
-async function clearoutBulkSubmit(emails: string[]): Promise<string> {
-  const csv = emailsToCsv(emails);
-  const formData = new FormData();
-  formData.append(
-    "file",
-    new Blob([csv], { type: "text/csv" }),
-    "emails.csv"
-  );
-  formData.append("optimize", "highest_accuracy");
-
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/bulk`, {
-    method: "POST",
-    headers: { Authorization: `Bearer:${getClearoutKey()}` },
-    body: formData,
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Clearout bulk API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as {
-    status: string;
-    data?: { list_id: string };
-    error?: { message: string };
-  };
-
-  if (json.status === "error" || !json.data?.list_id) {
-    throw new Error(
-      `Clearout bulk submit failed: ${json.error?.message ?? JSON.stringify(json)}`
-    );
-  }
-
-  return json.data.list_id;
-}
-
-async function clearoutBulkStatus(
-  listId: string
-): Promise<{ progress_status: string; percentile: number }> {
-  const params = new URLSearchParams({ list_id: listId });
-  const res = await fetch(
-    `${CLEAROUT_BASE}/email_verify/bulk/progress_status?${params}`,
-    { headers: { Authorization: `Bearer:${getClearoutKey()}` } }
-  );
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Clearout status API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as {
-    status: string;
-    data?: { progress_status: string; percentile: number };
-  };
-
-  return {
-    progress_status: json.data?.progress_status ?? "unknown",
-    percentile: json.data?.percentile ?? 0,
-  };
-}
-
-async function clearoutBulkResults(listId: string): Promise<string> {
-  const res = await fetch(`${CLEAROUT_BASE}/download/result`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer:${getClearoutKey()}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ list_id: listId }),
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`Clearout download API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as {
-    status: string;
-    data?: { url: string };
-    error?: { message: string };
-  };
-
-  if (json.status === "error" || !json.data?.url) {
-    throw new Error(
-      `Clearout download failed: ${json.error?.message ?? "no URL returned"}`
-    );
-  }
-
-  const fileRes = await fetch(json.data.url);
-  if (!fileRes.ok) {
-    throw new Error(`Failed to download results file: ${fileRes.status}`);
-  }
-
-  return await fileRes.text();
-}
-
-// -- ZeroBounce bulk --
-
-async function zbBulkSubmit(emails: string[]): Promise<string> {
-  const csv = emailsToCsv(emails);
-  const formData = new FormData();
-  formData.append("api_key", getZBKey());
-  formData.append("email_address_column", "1");
-  formData.append("has_header_row", "true");
-  formData.append(
-    "file",
-    new Blob([csv], { type: "text/csv" }),
-    "emails.csv"
-  );
-
-  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/sendfile`, {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`ZeroBounce bulk API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as {
-    success: boolean;
-    file_id?: string;
-    message?: string;
-  };
-
-  if (!json.success || !json.file_id) {
-    throw new Error(
-      `ZeroBounce bulk submit failed: ${json.message ?? "Unknown error"}`
-    );
-  }
-
-  return json.file_id;
-}
-
-async function zbBulkStatus(
-  fileId: string
-): Promise<{ file_status: string; complete_percentage: string }> {
-  const params = new URLSearchParams({
-    api_key: getZBKey(),
-    file_id: fileId,
-  });
-  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/filestatus?${params}`);
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`ZeroBounce status API ${res.status}: ${body}`);
-  }
-
-  const json = (await res.json()) as Record<string, unknown>;
-  return {
-    file_status: String(json.file_status ?? "unknown"),
-    complete_percentage: String(json.complete_percentage ?? "0"),
-  };
-}
-
-async function zbBulkResults(fileId: string): Promise<string> {
-  const params = new URLSearchParams({
-    api_key: getZBKey(),
-    file_id: fileId,
-  });
-  const res = await fetch(`${ZEROBOUNCE_BULK_BASE}/getfile?${params}`);
-
-  if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`ZeroBounce results API ${res.status}: ${body}`);
-  }
-
-  return await res.text();
-}
+import * as clearout from "./clients/clearout.js";
+import * as zerobounce from "./clients/zerobounce.js";
+import * as apollo from "./clients/apollo.js";
+import * as reply from "./clients/reply.js";
+import { parseCsv } from "./utils/csv.js";
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -613,6 +44,12 @@ export function createServer(ctx?: ServerContext): McpServer {
     };
   }
 
+  // Tool result shape returned by handlers
+  type ToolResult = {
+    content: Array<{ type: "text"; text: string }>;
+    isError?: boolean;
+  };
+
   // Wrap a tool handler to log actual credits from its response
   function tracked<T>(
     tool: string,
@@ -620,8 +57,8 @@ export function createServer(ctx?: ServerContext): McpServer {
       provider: string | null | ((args: T) => string | null);
       emailCount: (args: T) => number;
     },
-    handler: (args: T, extra: any) => Promise<any>
-  ): (args: T, extra: any) => Promise<any> {
+    handler: (args: T, extra: unknown) => Promise<ToolResult>
+  ): (args: T, extra: unknown) => Promise<ToolResult> {
     return async (args: T, extra: any) => {
       const start = Date.now();
       const result = await handler(args, extra);
@@ -677,12 +114,12 @@ export function createServer(ctx?: ServerContext): McpServer {
       // Single email — simple path
       if (emails.length === 1) {
         try {
-          const result = await verifyEmail(emails[0]);
+          const result = await clearout.verifyEmail(emails[0]);
 
           // Fetch credit balance (non-fatal)
           let creditsRemaining: Record<string, unknown> | null = null;
           try {
-            const { credits } = await getCredits();
+            const { credits } = await clearout.getCredits();
             creditsRemaining = credits;
           } catch {
             // best-effort
@@ -705,7 +142,7 @@ export function createServer(ctx?: ServerContext): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: isCreditExhausted(msg)
+                text: clearout.isCreditExhausted(msg)
                   ? JSON.stringify(
                       {
                         error:
@@ -726,9 +163,9 @@ export function createServer(ctx?: ServerContext): McpServer {
       // Multiple emails — pre-flight credit check, then sequential
       let preflightCredits: Record<string, unknown> | null = null;
       try {
-        const { credits } = await getCredits();
+        const { credits } = await clearout.getCredits();
         preflightCredits = credits;
-        const avail = extractAvailableCredits(credits);
+        const avail = clearout.extractAvailableCredits(credits);
         if (avail !== null && avail < emails.length) {
           return {
             content: [
@@ -756,7 +193,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       const results: Array<
-        ClearoutVerifyResult | { email: string; error: string }
+        clearout.ClearoutVerifyResult | { email: string; error: string }
       > = [];
       let rateLimited = false;
       let creditExhausted = false;
@@ -778,7 +215,7 @@ export function createServer(ctx?: ServerContext): McpServer {
 
         const batch = emails.slice(i, i + BATCH_SIZE);
         const batchResults = await Promise.allSettled(
-          batch.map((addr) => verifyEmail(addr))
+          batch.map((addr) => clearout.verifyEmail(addr))
         );
 
         for (let j = 0; j < batchResults.length; j++) {
@@ -797,7 +234,7 @@ export function createServer(ctx?: ServerContext): McpServer {
               br.reason instanceof Error
                 ? br.reason.message
                 : String(br.reason);
-            if (isCreditExhausted(msg)) {
+            if (clearout.isCreditExhausted(msg)) {
               creditExhausted = true;
               results.push({ email: batch[j], error: "Credits exhausted" });
             } else if (
@@ -821,7 +258,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       // Post-flight: fetch current credit balance
       let creditsRemaining: Record<string, unknown> | null = null;
       try {
-        const { credits } = await getCredits();
+        const { credits } = await clearout.getCredits();
         creditsRemaining = credits;
       } catch {
         // non-fatal
@@ -865,11 +302,11 @@ export function createServer(ctx?: ServerContext): McpServer {
       // Single email — simple path
       if (emails.length === 1) {
         try {
-          const result = await zbVerifyEmail(emails[0]);
+          const result = await zerobounce.verifyEmail(emails[0]);
 
           let creditsRemaining: number | null = null;
           try {
-            creditsRemaining = await getZBCredits();
+            creditsRemaining = await zerobounce.getCredits();
           } catch {
             // best-effort
           }
@@ -896,7 +333,7 @@ export function createServer(ctx?: ServerContext): McpServer {
             content: [
               {
                 type: "text" as const,
-                text: isZBCreditExhausted(msg)
+                text: zerobounce.isCreditExhausted(msg)
                   ? JSON.stringify(
                       {
                         error:
@@ -916,7 +353,7 @@ export function createServer(ctx?: ServerContext): McpServer {
 
       // Multiple emails — pre-flight credit check, then sequential
       try {
-        const avail = await getZBCredits();
+        const avail = await zerobounce.getCredits();
         if (avail < emails.length) {
           return {
             content: [
@@ -944,7 +381,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       const results: Array<
-        ZBVerifyResult | { email: string; error: string }
+        zerobounce.ZBVerifyResult | { email: string; error: string }
       > = [];
       let rateLimited = false;
       let creditExhausted = false;
@@ -966,7 +403,7 @@ export function createServer(ctx?: ServerContext): McpServer {
 
         const batch = emails.slice(i, i + BATCH_SIZE);
         const batchResults = await Promise.allSettled(
-          batch.map((addr) => zbVerifyEmail(addr))
+          batch.map((addr) => zerobounce.verifyEmail(addr))
         );
 
         for (let j = 0; j < batchResults.length; j++) {
@@ -979,7 +416,7 @@ export function createServer(ctx?: ServerContext): McpServer {
               br.reason instanceof Error
                 ? br.reason.message
                 : String(br.reason);
-            if (isZBCreditExhausted(msg)) {
+            if (zerobounce.isCreditExhausted(msg)) {
               creditExhausted = true;
               results.push({ email: batch[j], error: "Credits exhausted" });
             } else if (
@@ -1003,7 +440,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       // Post-flight credit balance
       let creditsRemaining: number | null = null;
       try {
-        creditsRemaining = await getZBCredits();
+        creditsRemaining = await zerobounce.getCredits();
       } catch {
         // non-fatal
       }
@@ -1046,8 +483,8 @@ export function createServer(ctx?: ServerContext): McpServer {
       try {
         const jobId =
           provider === "clearout"
-            ? await clearoutBulkSubmit(emails)
-            : await zbBulkSubmit(emails);
+            ? await clearout.bulkSubmit(emails)
+            : await zerobounce.bulkSubmit(emails);
 
         return {
           content: [
@@ -1097,7 +534,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         let status: Record<string, unknown>;
 
         if (provider === "clearout") {
-          const s = await clearoutBulkStatus(job_id);
+          const s = await clearout.bulkStatus(job_id);
           const done =
             s.progress_status.toLowerCase() === "completed" ||
             s.percentile >= 100;
@@ -1109,7 +546,7 @@ export function createServer(ctx?: ServerContext): McpServer {
             is_complete: done,
           };
         } else {
-          const s = await zbBulkStatus(job_id);
+          const s = await zerobounce.bulkStatus(job_id);
           const done = s.file_status === "Complete";
           status = {
             provider,
@@ -1161,8 +598,8 @@ export function createServer(ctx?: ServerContext): McpServer {
       try {
         const csvText =
           provider === "clearout"
-            ? await clearoutBulkResults(job_id)
-            : await zbBulkResults(job_id);
+            ? await clearout.bulkResults(job_id)
+            : await zerobounce.bulkResults(job_id);
 
         const parsed = parseCsv(csvText);
 
@@ -1228,7 +665,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       const report: Record<string, unknown> = {};
 
       try {
-        const { credits } = await getCredits();
+        const { credits } = await clearout.getCredits();
         report.clearout = credits;
       } catch (err) {
         report.clearout = {
@@ -1237,7 +674,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       try {
-        const credits = await getZBCredits();
+        const credits = await zerobounce.getCredits();
         report.zerobounce = { available: credits };
       } catch (err) {
         report.zerobounce = {
@@ -1281,7 +718,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         params.set("top", String(top ?? 100));
         if (status) params.set("status", status);
 
-        const data = (await replyGet(
+        const data = (await reply.get(
           `/v3/sequences?${params}`
         )) as { items: unknown[]; hasMore: boolean };
 
@@ -1325,7 +762,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("reply_get_sequence", { provider: "reply", emailCount: () => 0 },
     async ({ sequence_id }) => {
       try {
-        const data = await replyGet(`/v2/campaigns/${sequence_id}`);
+        const data = await reply.get(`/v2/campaigns/${sequence_id}`);
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(data, null, 2) },
@@ -1355,7 +792,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("reply_search_contact", { provider: "reply", emailCount: () => 1 },
     async ({ email }) => {
       try {
-        const data = await replyGet(
+        const data = await reply.get(
           `/v1/people?email=${encodeURIComponent(email)}`
         );
         return {
@@ -1448,7 +885,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           payload.customFields = contact.customFields;
 
         try {
-          const res = await replyPost(
+          const res = await reply.post(
             "/v1/actions/addandpushtocampaign",
             payload
           );
@@ -1529,7 +966,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("apollo_enrich_person", { provider: "apollo", emailCount: () => 1 },
     async (args) => {
       try {
-        const data = (await apolloPost("/people/match", args)) as {
+        const data = (await apollo.post("/people/match", args)) as {
           person: Record<string, unknown> | null;
         };
         if (!data.person) {
@@ -1587,7 +1024,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("apollo_bulk_enrich_people", { provider: "apollo", emailCount: ({ details }: any) => details.length },
     async ({ details }) => {
       try {
-        const data = (await apolloPost("/people/bulk_match", {
+        const data = (await apollo.post("/people/bulk_match", {
           details,
         })) as { matches: Array<Record<string, unknown> | null> };
 
@@ -1634,7 +1071,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("apollo_enrich_org", { provider: "apollo", emailCount: () => 0 },
     async ({ domain }) => {
       try {
-        const data = await apolloPost("/organizations/enrich", { domain });
+        const data = await apollo.post("/organizations/enrich", { domain });
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(data, null, 2) },
@@ -1680,7 +1117,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("apollo_search_people", { provider: "apollo", emailCount: () => 0 },
     async (args) => {
       try {
-        const data = await apolloPost("/mixed_people/api_search", {
+        const data = await apollo.post("/mixed_people/api_search", {
           ...args,
           page: args.page ?? 1,
         });
@@ -1883,13 +1320,13 @@ export function createServer(ctx?: ServerContext): McpServer {
       // -- Live credit balances --
       const credits: Record<string, unknown> = {};
       try {
-        const { credits: co } = await getCredits();
+        const { credits: co } = await clearout.getCredits();
         credits.clearout = co;
       } catch (err) {
         credits.clearout = { error: err instanceof Error ? err.message : String(err) };
       }
       try {
-        const zb = await getZBCredits();
+        const zb = await zerobounce.getCredits();
         credits.zerobounce = { available: zb };
       } catch (err) {
         credits.zerobounce = { error: err instanceof Error ? err.message : String(err) };

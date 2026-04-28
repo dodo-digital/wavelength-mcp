@@ -185,15 +185,32 @@
       }
     }
 
-    function deny() {
-      if (redirectUri) {
-        const url = new URL(redirectUri);
-        url.searchParams.set("error", "access_denied");
-        if (state) url.searchParams.set("state", state);
-        window.location.href = url.toString();
-      } else {
-        window.close();
+    async function deny() {
+      // Let Better Auth validate the redirect_uri and construct the error redirect
+      // (prevents open redirect via attacker-controlled redirect_uri)
+      try {
+        const resp = await fetch("/api/auth/oauth2/consent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            accept: false,
+            clientId,
+            redirectUri,
+            state,
+          }),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.redirectTo || data.url) {
+            window.location.href = data.redirectTo || data.url;
+            return;
+          }
+        }
+      } catch {
+        // Consent endpoint failed — don't redirect to unvalidated URI
       }
+      window.close();
     }
 
     function copyCode() {
