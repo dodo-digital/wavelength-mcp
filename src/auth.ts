@@ -23,7 +23,7 @@ export const auth = betterAuth({
       consentPage: "/consent",
       allowDynamicClientRegistration: true,
       allowUnauthenticatedClientRegistration: true,
-      scopes: ["openid", "profile", "email", "offline_access", "mcp"],
+      scopes: ["openid", "profile", "email", "offline_access"],
     }),
   ],
 });

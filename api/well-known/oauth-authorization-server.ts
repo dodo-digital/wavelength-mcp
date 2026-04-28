@@ -24,7 +24,7 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
     authorization_endpoint: `${BASE}/api/auth/oauth2/authorize`,
     token_endpoint: `${BASE}/api/auth/oauth2/token`,
     registration_endpoint: `${BASE}/api/auth/oauth2/register`,
-    scopes_supported: ["mcp", "openid", "profile", "email"],
+    scopes_supported: ["openid", "profile", "email"],
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     token_endpoint_auth_methods_supported: [

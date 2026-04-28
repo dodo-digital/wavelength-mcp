@@ -21,6 +21,6 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
     resource: RESOURCE_URL,
     authorization_servers: [RESOURCE_URL],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["mcp"],
+    scopes_supported: ["openid", "profile", "email"],
   });
 }
