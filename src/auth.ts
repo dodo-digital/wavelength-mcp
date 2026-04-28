@@ -21,6 +21,7 @@ export const auth = betterAuth({
     oauthProvider({
       loginPage: "/sign-in",
       consentPage: "/consent",
+      allowDynamicClientRegistration: true,
     }),
   ],
 });
