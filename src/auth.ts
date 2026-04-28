@@ -22,6 +22,7 @@ export const auth = betterAuth({
       loginPage: "/sign-in",
       consentPage: "/consent",
       allowDynamicClientRegistration: true,
+      allowUnauthenticatedClientRegistration: true,
     }),
   ],
 });
