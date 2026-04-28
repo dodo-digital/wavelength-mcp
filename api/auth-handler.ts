@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { toNodeHandler } from "better-auth/node";
-import { auth } from "../../src/auth.js";
+import { auth } from "../src/auth.js";
 
 // Disable Vercel body parsing — Better Auth needs the raw stream
 export const config = { api: { bodyParser: false } };
