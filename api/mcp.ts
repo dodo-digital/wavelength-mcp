@@ -56,15 +56,15 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
               `) as { id: string }[];
               userId = inserted[0]?.id ?? null;
             }
-          } catch {
-            // DB issue — auth still valid, proceed without user tracking
+          } catch (err) {
+            console.error("[mcp-auth] DB user lookup/create failed:", err);
           }
         }
         console.log("[mcp-auth]", { method: "better-auth", hasBearer, userId });
         return { authenticated: true, userId, token };
       }
-    } catch {
-      // Better Auth validation failed — fall through to legacy auth
+    } catch (err) {
+      console.error("[mcp-auth] Better Auth validation failed:", err);
     }
   }
 
@@ -82,8 +82,8 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
         console.log("[mcp-auth]", { method: "db-token", hasBearer, userId: user.id });
         return { authenticated: true, userId: user.id, token };
       }
-    } catch {
-      // DB unavailable — fall through to shared token
+    } catch (err) {
+      console.error("[mcp-auth] DB token lookup failed:", err);
     }
   }
 
@@ -157,6 +157,7 @@ export default async function handler(
       const sql = getSql();
 
       const server = createServer({
+        userId: authResult.userId,
         onToolCall: sql
           ? async (entry) => {
               await logCall(sql, authResult.userId, entry).catch(() => {});

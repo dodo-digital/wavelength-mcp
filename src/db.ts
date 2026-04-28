@@ -100,27 +100,3 @@ export async function logHealthCheck(
   `;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers for request-level instrumentation
-// ---------------------------------------------------------------------------
-
-export function inferProvider(
-  toolName: string,
-  args?: Record<string, unknown>
-): string | null {
-  if (toolName === "validate_email") return "clearout";
-  if (toolName === "zb_validate_email") return "zerobounce";
-  if (args?.provider && typeof args.provider === "string") return args.provider;
-  return null;
-}
-
-export function countEmails(args?: Record<string, unknown>): number {
-  if (!args) return 0;
-  if (args.email) {
-    return Array.isArray(args.email) ? args.email.length : 1;
-  }
-  if (args.emails) {
-    return Array.isArray(args.emails) ? args.emails.length : 0;
-  }
-  return 0;
-}

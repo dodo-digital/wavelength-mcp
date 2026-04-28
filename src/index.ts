@@ -333,10 +333,15 @@ async function replyPost(
     body: JSON.stringify(body),
   });
   const text = await res.text();
-  return {
-    status: res.status,
-    body: text ? JSON.parse(text) : null,
-  };
+  let parsed: unknown = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = text;
+    }
+  }
+  return { status: res.status, body: parsed };
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +581,7 @@ async function zbBulkResults(fileId: string): Promise<string> {
 // ---------------------------------------------------------------------------
 
 export interface ServerContext {
+  userId?: string | null;
   onToolCall?: (entry: {
     tool: string;
     provider?: string;
@@ -592,6 +598,20 @@ export function createServer(ctx?: ServerContext): McpServer {
     name: "wavelength",
     version: "1.0.0",
   });
+
+  // Gate a tool behind authenticated user — returns error response or null
+  function requireAuth(label: string) {
+    if (ctx?.userId) return null;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ error: `Authentication required for ${label}` }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
 
   // Wrap a tool handler to log actual credits from its response
   function tracked<T>(
@@ -741,50 +761,60 @@ export function createServer(ctx?: ServerContext): McpServer {
       let rateLimited = false;
       let creditExhausted = false;
       let creditsUsed = 0;
+      const BATCH_SIZE = 5;
 
-      for (let i = 0; i < emails.length; i++) {
-        const addr = emails[i];
-
+      for (let i = 0; i < emails.length; i += BATCH_SIZE) {
         if (rateLimited || creditExhausted) {
-          results.push({
-            email: addr,
-            error: creditExhausted
-              ? "Skipped — credits exhausted"
-              : "Skipped — rate limited",
-          });
-          continue;
+          for (let j = i; j < emails.length; j++) {
+            results.push({
+              email: emails[j],
+              error: creditExhausted
+                ? "Skipped — credits exhausted"
+                : "Skipped — rate limited",
+            });
+          }
+          break;
         }
 
-        try {
-          const result = await verifyEmail(addr);
-          results.push(result);
-          creditsUsed++;
+        const batch = emails.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.allSettled(
+          batch.map((addr) => verifyEmail(addr))
+        );
 
-          if (
-            result._rate_limit_remaining !== undefined &&
-            result._rate_limit_remaining < 2
-          ) {
-            rateLimited = true;
-          }
-
-          // Small delay between requests
-          if (i < emails.length - 1) {
-            await new Promise((r) => setTimeout(r, 200));
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (isCreditExhausted(msg)) {
-            creditExhausted = true;
-            results.push({ email: addr, error: "Credits exhausted" });
-          } else if (
-            msg.includes("429") ||
-            msg.toLowerCase().includes("rate")
-          ) {
-            rateLimited = true;
-            results.push({ email: addr, error: "Rate limited" });
+        for (let j = 0; j < batchResults.length; j++) {
+          const br = batchResults[j];
+          if (br.status === "fulfilled") {
+            results.push(br.value);
+            creditsUsed++;
+            if (
+              br.value._rate_limit_remaining !== undefined &&
+              br.value._rate_limit_remaining < 2
+            ) {
+              rateLimited = true;
+            }
           } else {
-            results.push({ email: addr, error: msg });
+            const msg =
+              br.reason instanceof Error
+                ? br.reason.message
+                : String(br.reason);
+            if (isCreditExhausted(msg)) {
+              creditExhausted = true;
+              results.push({ email: batch[j], error: "Credits exhausted" });
+            } else if (
+              msg.includes("429") ||
+              msg.toLowerCase().includes("rate")
+            ) {
+              rateLimited = true;
+              results.push({ email: batch[j], error: "Rate limited" });
+            } else {
+              results.push({ email: batch[j], error: msg });
+            }
           }
+        }
+
+        // Delay between batches
+        if (i + BATCH_SIZE < emails.length && !rateLimited && !creditExhausted) {
+          await new Promise((r) => setTimeout(r, 200));
         }
       }
 
@@ -919,42 +949,54 @@ export function createServer(ctx?: ServerContext): McpServer {
       let rateLimited = false;
       let creditExhausted = false;
       let creditsUsed = 0;
+      const BATCH_SIZE = 5;
 
-      for (let i = 0; i < emails.length; i++) {
-        const addr = emails[i];
-
+      for (let i = 0; i < emails.length; i += BATCH_SIZE) {
         if (rateLimited || creditExhausted) {
-          results.push({
-            email: addr,
-            error: creditExhausted
-              ? "Skipped — credits exhausted"
-              : "Skipped — rate limited",
-          });
-          continue;
+          for (let j = i; j < emails.length; j++) {
+            results.push({
+              email: emails[j],
+              error: creditExhausted
+                ? "Skipped — credits exhausted"
+                : "Skipped — rate limited",
+            });
+          }
+          break;
         }
 
-        try {
-          const result = await zbVerifyEmail(addr);
-          results.push(result);
-          if (result.status !== "unknown") creditsUsed++;
+        const batch = emails.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.allSettled(
+          batch.map((addr) => zbVerifyEmail(addr))
+        );
 
-          if (i < emails.length - 1) {
-            await new Promise((r) => setTimeout(r, 200));
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          if (isZBCreditExhausted(msg)) {
-            creditExhausted = true;
-            results.push({ email: addr, error: "Credits exhausted" });
-          } else if (
-            msg.includes("429") ||
-            msg.toLowerCase().includes("rate")
-          ) {
-            rateLimited = true;
-            results.push({ email: addr, error: "Rate limited" });
+        for (let j = 0; j < batchResults.length; j++) {
+          const br = batchResults[j];
+          if (br.status === "fulfilled") {
+            results.push(br.value);
+            if (br.value.status !== "unknown") creditsUsed++;
           } else {
-            results.push({ email: addr, error: msg });
+            const msg =
+              br.reason instanceof Error
+                ? br.reason.message
+                : String(br.reason);
+            if (isZBCreditExhausted(msg)) {
+              creditExhausted = true;
+              results.push({ email: batch[j], error: "Credits exhausted" });
+            } else if (
+              msg.includes("429") ||
+              msg.toLowerCase().includes("rate")
+            ) {
+              rateLimited = true;
+              results.push({ email: batch[j], error: "Rate limited" });
+            } else {
+              results.push({ email: batch[j], error: msg });
+            }
           }
+        }
+
+        // Delay between batches
+        if (i + BATCH_SIZE < emails.length && !rateLimited && !creditExhausted) {
+          await new Promise((r) => setTimeout(r, 200));
         }
       }
 
@@ -1348,7 +1390,7 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- reply_push_contacts ----------------------------------------------------
   server.tool(
     "reply_push_contacts",
-    "Add one or more contacts to a Reply.io sequence. Creates the contact if new, updates if existing, then pushes to the specified campaign. This is the primary tool for the Grata → Reply.io pipeline. Always confirm with the user before calling.",
+    "Add up to 50 contacts to a Reply.io sequence. Creates the contact if new, updates if existing, then pushes to the specified campaign. For larger batches, call multiple times. Always confirm with the user before calling.",
     {
       sequence_id: z.number().describe("The sequence/campaign ID to add contacts to"),
       contacts: z
@@ -1370,8 +1412,8 @@ export function createServer(ctx?: ServerContext): McpServer {
           })
         )
         .min(1)
-        .max(500)
-        .describe("Array of contacts to add"),
+        .max(50)
+        .describe("Array of contacts to add (max 50 per call)"),
     },
     tracked("reply_push_contacts", { provider: "reply", emailCount: ({ contacts }: any) => contacts.length },
     async ({ sequence_id, contacts }) => {
@@ -1381,55 +1423,64 @@ export function createServer(ctx?: ServerContext): McpServer {
         error?: string;
       }> = [];
 
-      for (let i = 0; i < contacts.length; i++) {
-        const contact = contacts[i];
-        try {
-          const payload: Record<string, unknown> = {
-            campaignId: sequence_id,
-            email: contact.email,
-            firstName: contact.firstName,
-          };
-          if (contact.lastName) payload.lastName = contact.lastName;
-          if (contact.title) payload.title = contact.title;
-          if (contact.company) payload.company = contact.company;
-          if (contact.city) payload.city = contact.city;
-          if (contact.state) payload.state = contact.state;
-          if (contact.country) payload.country = contact.country;
-          if (contact.phone) payload.phone = contact.phone;
-          if (contact.linkedInProfile)
-            payload.linkedInProfile = contact.linkedInProfile;
-          if (contact.customFields)
-            payload.customFields = contact.customFields;
+      const BATCH_SIZE = 5;
 
+      async function pushOne(contact: typeof contacts[number]): Promise<{
+        email: string;
+        status: "added" | "error";
+        error?: string;
+      }> {
+        const payload: Record<string, unknown> = {
+          campaignId: sequence_id,
+          email: contact.email,
+          firstName: contact.firstName,
+        };
+        if (contact.lastName) payload.lastName = contact.lastName;
+        if (contact.title) payload.title = contact.title;
+        if (contact.company) payload.company = contact.company;
+        if (contact.city) payload.city = contact.city;
+        if (contact.state) payload.state = contact.state;
+        if (contact.country) payload.country = contact.country;
+        if (contact.phone) payload.phone = contact.phone;
+        if (contact.linkedInProfile)
+          payload.linkedInProfile = contact.linkedInProfile;
+        if (contact.customFields)
+          payload.customFields = contact.customFields;
+
+        try {
           const res = await replyPost(
             "/v1/actions/addandpushtocampaign",
             payload
           );
-
           if (res.status >= 200 && res.status < 300) {
-            results.push({ email: contact.email, status: "added" });
-          } else {
-            const errMsg =
-              typeof res.body === "object" && res.body !== null
-                ? JSON.stringify(res.body)
-                : String(res.body);
-            results.push({
-              email: contact.email,
-              status: "error",
-              error: `HTTP ${res.status}: ${errMsg}`,
-            });
+            return { email: contact.email, status: "added" };
           }
-
-          // Small delay between requests to avoid rate limits
-          if (i < contacts.length - 1) {
-            await new Promise((r) => setTimeout(r, 300));
-          }
+          const errMsg =
+            typeof res.body === "object" && res.body !== null
+              ? JSON.stringify(res.body)
+              : String(res.body);
+          return {
+            email: contact.email,
+            status: "error",
+            error: `HTTP ${res.status}: ${errMsg}`,
+          };
         } catch (err) {
-          results.push({
+          return {
             email: contact.email,
             status: "error",
             error: err instanceof Error ? err.message : String(err),
-          });
+          };
+        }
+      }
+
+      for (let i = 0; i < contacts.length; i += BATCH_SIZE) {
+        const batch = contacts.slice(i, i + BATCH_SIZE);
+        const batchResults = await Promise.all(batch.map(pushOne));
+        results.push(...batchResults);
+
+        // Delay between batches to avoid rate limits
+        if (i + BATCH_SIZE < contacts.length) {
+          await new Promise((r) => setTimeout(r, 200));
         }
       }
 
@@ -1751,6 +1802,9 @@ export function createServer(ctx?: ServerContext): McpServer {
         .describe("The learning itself. Be specific and actionable. E.g. 'MSP with dedicated SOC practice = HIGH eligible, not automatic LOW'"),
     },
     async ({ skill, industry, category, content }) => {
+      const denied = requireAuth("save_skill_learning");
+      if (denied) return denied;
+
       const sql = getSql();
       if (!sql) {
         return {
@@ -1820,6 +1874,9 @@ export function createServer(ctx?: ServerContext): McpServer {
         .describe("Number of days to look back (default 7)"),
     },
     async ({ days }) => {
+      const denied = requireAuth("admin_report");
+      if (denied) return denied;
+
       const lookback = days ?? 7;
       const report: Record<string, unknown> = { period_days: lookback };
 
