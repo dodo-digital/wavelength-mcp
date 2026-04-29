@@ -1191,6 +1191,9 @@ export function createServer(ctx?: ServerContext): McpServer {
         .describe("Filter by industry (e.g. 'cybersecurity'). Omit to get all learnings for the skill."),
     },
     async ({ skill, industry }) => {
+      const denied = requireAuth("get_skill_learnings");
+      if (denied) return denied;
+
       const sql = getSql();
       if (!sql) {
         return {
@@ -1368,11 +1371,13 @@ Set include_history: true to see edit history for a document.`,
         .optional()
         .describe("Filter by document type: 'thesis', 'reference', 'source', 'criteria', 'template'"),
       tags: z
-        .array(z.string())
+        .array(z.string().max(200))
+        .max(50)
         .optional()
         .describe("Filter by namespaced tags — returns docs matching ANY tag. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}"),
       keyword: z
         .string()
+        .max(500, "Keyword too long")
         .optional()
         .describe("Full-text search across title and content"),
       include_history: z
@@ -1433,7 +1438,7 @@ Set include_history: true to see edit history for a document.`,
         } else if (keyword?.trim() || (tags && tags.length > 0) || doc_type) {
           // Path 2: Composable search (keyword + tags + doc_type — any combination)
           const rows = (await sql`
-            SELECT id, slug, doc_type, title, content, tags, metadata, version, updated_by, created_at, updated_at
+            SELECT id, slug, doc_type, title, tags, metadata, version, updated_by, created_at, updated_at
             FROM wl_context
             WHERE true
               ${keyword?.trim() ? sql`AND to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '')) @@ plainto_tsquery('english', ${keyword.trim()})` : sql``}
@@ -1462,8 +1467,9 @@ Set include_history: true to see edit history for a document.`,
 
         result = { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
       } catch (err) {
+        console.error("[query_context]", err);
         result = {
-          content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text" as const, text: JSON.stringify({ error: "Query failed" }, null, 2) }],
           isError: true,
         };
       }
@@ -1510,21 +1516,25 @@ METADATA — use for structured fields that don't fit in tags:
     {
       slug: z
         .string()
+        .max(128, "Slug too long")
         .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Slug must be kebab-case (e.g. 'thesis', 'scoring-criteria-cybersecurity')")
         .describe("Unique kebab-case identifier (e.g. 'thesis', 'sources', 'scoring-criteria-cybersecurity')"),
       title: z
         .string()
+        .max(500, "Title too long")
         .describe("Human-readable title"),
       content: z
         .string()
         .min(1, "Content cannot be empty")
+        .max(100000, "Content exceeds 100KB limit")
         .describe("Full document content in markdown"),
       doc_type: z
         .enum(["thesis", "reference", "source", "criteria", "template"])
         .optional()
         .describe("Document type: thesis (investment thesis), reference (general), source (data source registry), criteria (scoring/evaluation), template (reusable format). Defaults to 'reference' for new documents. Omit on update to preserve existing type."),
       tags: z
-        .array(z.string())
+        .array(z.string().max(200, "Tag too long"))
+        .max(50, "Too many tags")
         .optional()
         .describe("Namespaced tags for queryability. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}. Always include at least status/active and relevant skill/ or topic/ tags. When omitted on update, existing tags are preserved."),
       metadata: z
@@ -1651,8 +1661,13 @@ METADATA — use for structured fields that don't fit in tags:
           };
         }
       } catch (err) {
+        console.error("[update_context]", err);
+        const isDuplicateVersion = err instanceof Error && err.message.includes("idx_wl_context_history_unique_version");
         result = {
-          content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          content: [{ type: "text" as const, text: JSON.stringify({
+            error: isDuplicateVersion ? "Concurrent edit detected — retry your update" : "Update failed",
+            ...(isDuplicateVersion ? { retry: true } : {}),
+          }, null, 2) }],
           isError: true,
         };
       }
