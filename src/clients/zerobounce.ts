@@ -8,20 +8,20 @@ const ZEROBOUNCE_BULK_BASE = "https://bulkapi.zerobounce.net/v2";
 // ---------------------------------------------------------------------------
 
 const VerifyResponseSchema = z.object({
-  address: z.string().default(""),
-  status: z.string().default(""),
-  sub_status: z.string().default(""),
-  free_email: z.boolean().default(false),
+  address: z.string().nullable().default(""),
+  status: z.string().nullable().default(""),
+  sub_status: z.string().nullable().default(""),
+  free_email: z.boolean().nullable().default(false),
   did_you_mean: z.string().nullable().default(null),
   domain: z.string().nullable().default(null),
-  domain_age_days: z.string().default(""),
-  smtp_provider: z.string().default(""),
-  mx_found: z.string().default(""),
-  mx_record: z.string().default(""),
-  firstname: z.string().default(""),
-  lastname: z.string().default(""),
-  gender: z.string().default(""),
-  error: z.string().optional(),
+  domain_age_days: z.string().nullable().default(""),
+  smtp_provider: z.string().nullable().default(""),
+  mx_found: z.string().nullable().default(""),
+  mx_record: z.string().nullable().default(""),
+  firstname: z.string().nullable().default(""),
+  lastname: z.string().nullable().default(""),
+  gender: z.string().nullable().default(""),
+  error: z.string().nullable().optional(),
 });
 
 const CreditsResponseSchema = z.object({
