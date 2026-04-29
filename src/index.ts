@@ -135,14 +135,13 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- validate_email --------------------------------------------------------
   server.tool(
     "validate_email",
-    "Validate up to 20 email addresses via Clearout (instant, real-time). Returns deliverability verdict, disposable/free/role flags, and bounce type. Costs 1 credit per email. For more than 20 emails, use bulk_validate instead.",
+    "Clearout real-time validation (≤20 emails, 1 credit each). >20 → bulk_validate.",
     {
       email: z
         .union([
           z.string().email(),
           z.array(z.string().email()).min(1).max(20),
-        ])
-        .describe("A single email address or array of email addresses"),
+        ]),
     },
     tracked("validate_email", { provider: "clearout", emailCount: ({ email }: any) => Array.isArray(email) ? email.length : 1 },
     async ({ email }) => {
@@ -323,14 +322,13 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- zb_validate_email -----------------------------------------------------
   server.tool(
     "zb_validate_email",
-    "Validate up to 20 email addresses via ZeroBounce (instant, real-time). Returns status, sub_status, free_email, domain age, MX records, SMTP provider. Costs 1 credit per email (0 for unknown results). For more than 20 emails, use bulk_validate instead.",
+    "ZeroBounce real-time validation (≤20 emails, 1 credit each, 0 for unknowns). >20 → bulk_validate.",
     {
       email: z
         .union([
           z.string().email(),
           z.array(z.string().email()).min(1).max(20),
-        ])
-        .describe("A single email address or array of email addresses"),
+        ]),
     },
     tracked("zb_validate_email", { provider: "zerobounce", emailCount: ({ email }: any) => Array.isArray(email) ? email.length : 1 },
     async ({ email }) => {
@@ -504,16 +502,10 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- bulk_validate ---------------------------------------------------------
   server.tool(
     "bulk_validate",
-    "Submit a batch of emails for async validation (use for more than 20 emails). Returns a job_id to track progress. Processing takes 2-10 minutes depending on batch size. Call bulk_status to check progress, then bulk_results to retrieve data.",
+    "Async batch validation (>20 emails). Returns job_id → bulk_status → bulk_results.",
     {
-      provider: z
-        .enum(["clearout", "zerobounce"])
-        .describe("Which validation provider to use"),
-      emails: z
-        .array(z.string().email())
-        .min(1)
-        .max(10000)
-        .describe("Array of email addresses to validate"),
+      provider: z.enum(["clearout", "zerobounce"]),
+      emails: z.array(z.string().email()).min(1).max(10000),
     },
     tracked("bulk_validate", { provider: ({ provider }: any) => provider, emailCount: ({ emails }: any) => emails.length },
     async ({ provider, emails }) => {
@@ -558,12 +550,10 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- bulk_status ----------------------------------------------------------
   server.tool(
     "bulk_status",
-    "Check progress of a bulk validation job. Returns completion percentage and whether results are ready to download.",
+    "Check bulk validation job progress.",
     {
-      provider: z
-        .enum(["clearout", "zerobounce"])
-        .describe("Which provider the job was submitted to"),
-      job_id: z.string().describe("The job_id returned from bulk_validate"),
+      provider: z.enum(["clearout", "zerobounce"]),
+      job_id: z.string().describe("job_id from bulk_validate"),
     },
     tracked("bulk_status", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
@@ -623,12 +613,10 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- bulk_results ---------------------------------------------------------
   server.tool(
     "bulk_results",
-    "Download results of a completed bulk validation job. Returns structured validation data for each email. Only call after bulk_status shows is_complete: true.",
+    "Download completed bulk job results. Requires bulk_status is_complete: true.",
     {
-      provider: z
-        .enum(["clearout", "zerobounce"])
-        .describe("Which provider the job was submitted to"),
-      job_id: z.string().describe("The job_id returned from bulk_validate"),
+      provider: z.enum(["clearout", "zerobounce"]),
+      job_id: z.string().describe("job_id from bulk_validate"),
     },
     tracked("bulk_results", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
@@ -695,7 +683,7 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- check_credits ---------------------------------------------------------
   server.tool(
     "check_credits",
-    "Check remaining email verification credits for all providers (Clearout and ZeroBounce). Costs 0 credits.",
+    "Check Clearout + ZeroBounce credit balances. Free.",
     {},
     tracked("check_credits", { provider: null, emailCount: () => 0 },
     async () => {
@@ -735,18 +723,10 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- reply_list_sequences ---------------------------------------------------
   server.tool(
     "reply_list_sequences",
-    "List Reply.io sequences (campaigns). Returns id, name, status, health, and creation date. Use this to find the right sequence before adding contacts. Supports filtering by status (active/paused/new).",
+    "List Reply.io sequences. Filter by status.",
     {
-      status: z
-        .enum(["active", "paused", "new"])
-        .optional()
-        .describe("Filter by sequence status"),
-      top: z
-        .number()
-        .min(1)
-        .max(1000)
-        .optional()
-        .describe("Max results to return (default 100)"),
+      status: z.enum(["active", "paused", "new"]).optional(),
+      top: z.number().min(1).max(1000).optional().describe("Max results (default 100)"),
     },
     tracked("reply_list_sequences", { provider: "reply", emailCount: () => 0 },
     async ({ status, top }) => {
@@ -792,9 +772,9 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- reply_get_sequence -----------------------------------------------------
   server.tool(
     "reply_get_sequence",
-    "Get detailed info about a Reply.io sequence including email steps, templates, settings, and linked email accounts. Use to review campaign content or verify before adding contacts.",
+    "Get Reply.io sequence details (steps, templates, settings, linked accounts).",
     {
-      sequence_id: z.number().describe("The sequence/campaign ID"),
+      sequence_id: z.number(),
     },
     tracked("reply_get_sequence", { provider: "reply", emailCount: () => 0 },
     async ({ sequence_id }) => {
@@ -822,9 +802,9 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- reply_search_contact ---------------------------------------------------
   server.tool(
     "reply_search_contact",
-    "Look up a contact in Reply.io by email address. Returns profile details, custom fields, creation source, and which sequences they belong to.",
+    "Look up Reply.io contact by email.",
     {
-      email: z.string().email().describe("Email address to search for"),
+      email: z.string().email(),
     },
     tracked("reply_search_contact", { provider: "reply", emailCount: () => 1 },
     async ({ email }) => {
@@ -864,9 +844,9 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- reply_push_contacts ----------------------------------------------------
   server.tool(
     "reply_push_contacts",
-    "Add up to 50 contacts to a Reply.io sequence. Creates the contact if new, updates if existing, then pushes to the specified campaign. For larger batches, call multiple times. Always confirm with the user before calling.",
+    "Upsert + push ≤50 contacts to a Reply.io sequence. Confirm with user first.",
     {
-      sequence_id: z.number().describe("The sequence/campaign ID to add contacts to"),
+      sequence_id: z.number(),
       contacts: z
         .array(
           z.object({
@@ -886,8 +866,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           })
         )
         .min(1)
-        .max(50)
-        .describe("Array of contacts to add (max 50 per call)"),
+        .max(50),
     },
     tracked("reply_push_contacts", { provider: "reply", emailCount: ({ contacts }: any) => contacts.length },
     async ({ sequence_id, contacts }) => {
@@ -986,19 +965,13 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- apollo_enrich_person ---------------------------------------------------
   server.tool(
     "apollo_enrich_person",
-    "Enrich a single person via Apollo. Provide an email, LinkedIn URL, or name+company combo. Returns verified email, title, LinkedIn, employment history, location, and organization data. Costs 1 Apollo credit.",
+    "Apollo person enrichment by email, LinkedIn URL, or name+company. 1 credit.",
     {
-      email: z.string().optional().describe("Email address to match"),
-      linkedin_url: z
-        .string()
-        .optional()
-        .describe("LinkedIn profile URL to match"),
-      first_name: z.string().optional().describe("First name (use with last_name + organization_name)"),
-      last_name: z.string().optional().describe("Last name (use with first_name + organization_name)"),
-      organization_name: z
-        .string()
-        .optional()
-        .describe("Company name (use with first_name + last_name)"),
+      email: z.string().optional(),
+      linkedin_url: z.string().optional(),
+      first_name: z.string().optional().describe("Use with last_name + organization_name"),
+      last_name: z.string().optional(),
+      organization_name: z.string().optional(),
     },
     tracked("apollo_enrich_person", { provider: "apollo", emailCount: () => 1 },
     async (args) => {
@@ -1042,7 +1015,7 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- apollo_bulk_enrich_people ----------------------------------------------
   server.tool(
     "apollo_bulk_enrich_people",
-    "Enrich up to 10 people per call via Apollo bulk match. Provide an array of lookup objects (each with email, linkedin_url, or first_name+last_name+organization_name). For batches larger than 10, call this tool multiple times. Costs 1 credit per matched person.",
+    "Apollo bulk person match (≤10 per call, 1 credit/match). >10 → call multiple times.",
     {
       details: z
         .array(
@@ -1055,8 +1028,7 @@ export function createServer(ctx?: ServerContext): McpServer {
           })
         )
         .min(1)
-        .max(10)
-        .describe("Array of person lookup objects (max 10)"),
+        .max(10),
     },
     tracked("apollo_bulk_enrich_people", { provider: "apollo", emailCount: ({ details }: any) => details.length },
     async ({ details }) => {
@@ -1101,9 +1073,9 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- apollo_enrich_org ------------------------------------------------------
   server.tool(
     "apollo_enrich_org",
-    "Enrich a company/organization via Apollo. Provide a domain to get company details including industry, size, revenue, location, and technology stack.",
+    "Apollo company enrichment by domain.",
     {
-      domain: z.string().describe("Company domain (e.g. 'wavelengthequity.com')"),
+      domain: z.string().describe("e.g. 'wavelengthequity.com'"),
     },
     tracked("apollo_enrich_org", { provider: "apollo", emailCount: () => 0 },
     async ({ domain }) => {
@@ -1131,25 +1103,13 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- apollo_search_people ---------------------------------------------------
   server.tool(
     "apollo_search_people",
-    "Search Apollo's database for people matching criteria. Use to find contacts at a company when you don't have specific names. Returns up to 25 results per page.",
+    "Search Apollo people database. 25 results/page.",
     {
-      organization_domains: z
-        .array(z.string())
-        .optional()
-        .describe("Company domains to search within"),
-      person_titles: z
-        .array(z.string())
-        .optional()
-        .describe("Job titles to filter (e.g. ['CEO', 'Founder', 'Owner'])"),
-      person_seniorities: z
-        .array(z.string())
-        .optional()
-        .describe("Seniority levels: owner, founder, c_suite, partner, vp, director, manager"),
-      person_locations: z
-        .array(z.string())
-        .optional()
-        .describe("Locations (e.g. ['United States', 'New York'])"),
-      page: z.number().optional().describe("Page number (default 1)"),
+      organization_domains: z.array(z.string()).optional(),
+      person_titles: z.array(z.string()).optional().describe("e.g. ['CEO', 'Founder']"),
+      person_seniorities: z.array(z.string()).optional().describe("owner, founder, c_suite, partner, vp, director, manager"),
+      person_locations: z.array(z.string()).optional(),
+      page: z.number().optional(),
     },
     tracked("apollo_search_people", { provider: "apollo", emailCount: () => 0 },
     async (args) => {
@@ -1180,15 +1140,10 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- get_skill_learnings ----------------------------------------------------
   server.tool(
     "get_skill_learnings",
-    "Retrieve learned adjustments for a skill. Returns all active learnings, optionally filtered by industry. Call this at the start of every skill run to load accumulated knowledge from previous runs across all users.",
+    "Load skill learnings (cross-user knowledge). Call at start of every skill run.",
     {
-      skill: z
-        .string()
-        .describe("Skill name (e.g. 'company-processor', 'grata-search-enrichment')"),
-      industry: z
-        .string()
-        .optional()
-        .describe("Filter by industry (e.g. 'cybersecurity'). Omit to get all learnings for the skill."),
+      skill: z.string().describe("e.g. 'company-processor', 'grata-search-enrichment'"),
+      industry: z.string().optional().describe("e.g. 'cybersecurity'. Omit for all."),
     },
     async ({ skill, industry }) => {
       const denied = requireAuth("get_skill_learnings");
@@ -1261,22 +1216,14 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- save_skill_learning ----------------------------------------------------
   server.tool(
     "save_skill_learning",
-    "Save a new learning for a skill. Learnings accumulate across runs and users — every user's Claude instance sees them. Use after calibration, when encountering schema changes, edge cases in title filtering, business model patterns, or data quality issues. Each learning should be a single, actionable insight.",
+    "Save one actionable learning (visible to all users). Use for calibration, schema changes, edge cases, patterns.",
     {
-      skill: z
-        .string()
-        .describe("Skill name (e.g. 'company-processor', 'grata-search-enrichment')"),
-      industry: z
-        .string()
-        .optional()
-        .describe("Industry this learning applies to (e.g. 'cybersecurity'). Omit for global learnings."),
+      skill: z.string().describe("e.g. 'company-processor'"),
+      industry: z.string().optional().describe("Omit for global learnings"),
       category: z
         .enum(["adjustment", "schema-change", "edge-case", "pattern"])
-        .default("adjustment")
-        .describe("Type of learning: adjustment (calibration), schema-change (format change), edge-case (title/role), pattern (business model)"),
-      content: z
-        .string()
-        .describe("The learning itself. Be specific and actionable. E.g. 'MSP with dedicated SOC practice = HIGH eligible, not automatic LOW'"),
+        .default("adjustment"),
+      content: z.string().describe("Specific, actionable insight"),
     },
     async ({ skill, industry, category, content }) => {
       const denied = requireAuth("save_skill_learning");
@@ -1341,49 +1288,13 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- query_context ----------------------------------------------------------
   server.tool(
     "query_context",
-    `Search shared context documents (thesis, sources, scoring criteria, templates, etc.). Returns matching documents by slug, doc_type, tags, or full-text keyword search. Use this at the start of skill runs to load the latest thesis, scoring criteria, or any shared reference material.
-
-TAG TAXONOMY — use these namespaced tags for querying:
-  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety, industry/dental-it)
-  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
-  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata, source/apollo)
-  status/{status}    — Document state (e.g. status/active, status/draft, status/archived)
-  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
-  company/{slug}     — Company-specific context (e.g. company/acme-security)
-  person/{slug}      — Person-specific context (e.g. person/dino-bebeslic)
-
-Query examples:
-  slug: "thesis" → get the investment thesis (includes version number)
-  tags: ["industry/cybersecurity"] → all context for cybersecurity deals
-  tags: ["skill/deal-analysis"] → everything deal-analysis needs
-  doc_type: "source" → all data source registries
-  keyword: "EBITDA margin" → full-text search
-
-When called with no parameters, returns a summary index (no content) to save tokens. Use slug to fetch full document.
-Set include_history: true to see edit history for a document.`,
+    "Search shared context docs. By slug (full doc), doc_type, tags, keyword (full-text), or no params (summary index). Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces. include_history with slug for edit log.",
     {
-      slug: z
-        .string()
-        .optional()
-        .describe("Exact slug to retrieve (e.g. 'thesis', 'sources'). Returns one document with full content."),
-      doc_type: z
-        .string()
-        .optional()
-        .describe("Filter by document type: 'thesis', 'reference', 'source', 'criteria', 'template'"),
-      tags: z
-        .array(z.string().max(200))
-        .max(50)
-        .optional()
-        .describe("Filter by namespaced tags — returns docs matching ANY tag. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}"),
-      keyword: z
-        .string()
-        .max(500, "Keyword too long")
-        .optional()
-        .describe("Full-text search across title and content"),
-      include_history: z
-        .boolean()
-        .optional()
-        .describe("Include edit history (version log with who changed what and when). Only works with slug lookup."),
+      slug: z.string().optional().describe("Exact slug for full doc (e.g. 'thesis')"),
+      doc_type: z.string().optional().describe("thesis, reference, source, criteria, template"),
+      tags: z.array(z.string().max(200)).max(50).optional().describe("Namespaced tags (matches ANY)"),
+      keyword: z.string().max(500, "Keyword too long").optional(),
+      include_history: z.boolean().optional().describe("Edit log (slug lookup only)"),
     },
     async ({ slug, doc_type, tags, keyword, include_history }) => {
       const denied = requireAuth("query_context");
@@ -1494,53 +1405,24 @@ Set include_history: true to see edit history for a document.`,
   // -- update_context ---------------------------------------------------------
   server.tool(
     "update_context",
-    `Create or update a shared context document. Upserts by slug — if a document with this slug exists, it updates (and snapshots the previous version to history); otherwise creates a new one. Every edit is tracked with who made the change, the version number, and a timestamp. Use query_context with include_history: true to see the edit log.
-
-TAG TAXONOMY — always tag documents with these namespaced tags:
-  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety)
-  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
-  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata)
-  status/{status}    — Document state: active, draft, archived
-  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
-  company/{slug}     — Company-specific context
-  person/{slug}      — Person-specific context
-
-SLUG CONVENTIONS — kebab-case, descriptive:
-  "thesis" — main investment thesis
-  "sources" — data source registry
-  "scoring-criteria-{industry}" — industry-specific scoring
-  "template-{type}" — reusable templates (e.g. template-memo, template-outreach)
-
-METADATA — use for structured fields that don't fit in tags:
-  { revenue_range: "$2M-$70M", sectors: ["cybersecurity", "fire-safety"] }`,
+    "Upsert context doc by slug. Snapshots previous version to history. Tracks editor, version, timestamp. Omitting doc_type/tags/metadata on update preserves existing values. Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces.",
     {
       slug: z
         .string()
         .max(128, "Slug too long")
-        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Slug must be kebab-case (e.g. 'thesis', 'scoring-criteria-cybersecurity')")
-        .describe("Unique kebab-case identifier (e.g. 'thesis', 'sources', 'scoring-criteria-cybersecurity')"),
-      title: z
-        .string()
-        .max(500, "Title too long")
-        .describe("Human-readable title"),
-      content: z
-        .string()
-        .min(1, "Content cannot be empty")
-        .max(100000, "Content exceeds 100KB limit")
-        .describe("Full document content in markdown"),
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Kebab-case (e.g. 'thesis', 'scoring-criteria-cyber')"),
+      title: z.string().max(500, "Title too long"),
+      content: z.string().min(1).max(100000, "Content exceeds 100KB limit").describe("Markdown"),
       doc_type: z
         .enum(["thesis", "reference", "source", "criteria", "template"])
         .optional()
-        .describe("Document type: thesis (investment thesis), reference (general), source (data source registry), criteria (scoring/evaluation), template (reusable format). Defaults to 'reference' for new documents. Omit on update to preserve existing type."),
+        .describe("Defaults to 'reference' for new docs. Omit to preserve."),
       tags: z
         .array(z.string().max(200, "Tag too long"))
         .max(50, "Too many tags")
         .optional()
-        .describe("Namespaced tags for queryability. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}. Always include at least status/active and relevant skill/ or topic/ tags. When omitted on update, existing tags are preserved."),
-      metadata: z
-        .record(z.unknown())
-        .optional()
-        .describe("Structured key-value data. When omitted on update, existing metadata is preserved."),
+        .describe("Omit to preserve existing"),
+      metadata: z.record(z.unknown()).optional().describe("Omit to preserve existing"),
     },
     async ({ slug, title, content, doc_type, tags, metadata }) => {
       const denied = requireAuth("update_context");
@@ -1692,14 +1574,9 @@ METADATA — use for structured fields that don't fit in tags:
   // -- admin_report -----------------------------------------------------------
   server.tool(
     "admin_report",
-    "Generate an admin report of all MCP tool usage. Shows calls by tool and provider, credits consumed, error rates, and totals. Optionally filter by time range (default: last 7 days). Also fetches live credit balances from all providers.",
+    "Usage report: calls, credits, errors by tool/provider + live credit balances.",
     {
-      days: z
-        .number()
-        .min(1)
-        .max(90)
-        .optional()
-        .describe("Number of days to look back (default 7)"),
+      days: z.number().min(1).max(90).optional().describe("Lookback days (default 7)"),
     },
     async ({ days }) => {
       const denied = requireAuth("admin_report");
