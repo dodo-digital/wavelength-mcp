@@ -1298,6 +1298,249 @@ export function createServer(ctx?: ServerContext): McpServer {
     }
   );
 
+  // -- query_context ----------------------------------------------------------
+  server.tool(
+    "query_context",
+    `Search shared context documents (thesis, sources, scoring criteria, templates, etc.). Returns matching documents by slug, doc_type, tags, or full-text keyword search. Use this at the start of skill runs to load the latest thesis, scoring criteria, or any shared reference material.
+
+TAG TAXONOMY — use these namespaced tags for querying:
+  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety, industry/dental-it)
+  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
+  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata, source/apollo)
+  status/{status}    — Document state (e.g. status/active, status/draft, status/archived)
+  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
+  company/{slug}     — Company-specific context (e.g. company/acme-security)
+  person/{slug}      — Person-specific context (e.g. person/dino-bebeslic)
+
+Query examples:
+  slug: "thesis" → get the investment thesis
+  tags: ["industry/cybersecurity"] → all context for cybersecurity deals
+  tags: ["skill/deal-analysis"] → everything deal-analysis needs
+  doc_type: "source" → all data source registries
+  keyword: "EBITDA margin" → full-text search`,
+    {
+      slug: z
+        .string()
+        .optional()
+        .describe("Exact slug to retrieve (e.g. 'thesis', 'sources'). Returns one document."),
+      doc_type: z
+        .string()
+        .optional()
+        .describe("Filter by document type: 'thesis', 'reference', 'source', 'criteria', 'template'"),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Filter by namespaced tags — returns docs matching ANY tag. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}"),
+      keyword: z
+        .string()
+        .optional()
+        .describe("Full-text search across title and content"),
+    },
+    async ({ slug, doc_type, tags, keyword }) => {
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ documents: [], note: "Database not configured" }, null, 2),
+            },
+          ],
+        };
+      }
+
+      try {
+        let rows;
+
+        if (slug) {
+          // Exact lookup by slug
+          rows = await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE slug = ${slug}
+            LIMIT 1
+          `;
+        } else if (keyword) {
+          // Full-text search
+          const tsQuery = keyword.split(/\s+/).join(' & ');
+          rows = await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))
+                  @@ to_tsquery('english', ${tsQuery})
+              ${doc_type ? sql`AND doc_type = ${doc_type}` : sql``}
+            ORDER BY updated_at DESC
+            LIMIT 20
+          `;
+        } else if (tags && tags.length > 0) {
+          // Tag-based search (ANY match)
+          rows = await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE tags && ${tags}
+              ${doc_type ? sql`AND doc_type = ${doc_type}` : sql``}
+            ORDER BY updated_at DESC
+            LIMIT 20
+          `;
+        } else if (doc_type) {
+          // Filter by type only
+          rows = await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE doc_type = ${doc_type}
+            ORDER BY updated_at DESC
+            LIMIT 20
+          `;
+        } else {
+          // List all (summary — no content to save tokens)
+          rows = await sql`
+            SELECT id, slug, doc_type, title, tags, metadata, updated_by, created_at, updated_at
+            FROM wl_context
+            ORDER BY updated_at DESC
+            LIMIT 50
+          `;
+        }
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  count: (rows as unknown[]).length,
+                  documents: rows,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -- update_context ---------------------------------------------------------
+  server.tool(
+    "update_context",
+    `Create or update a shared context document. Upserts by slug — if a document with this slug exists, it updates; otherwise creates a new one. Use this to save thesis documents, scoring criteria, source registries, templates, or any shared reference material that skills should access.
+
+TAG TAXONOMY — always tag documents with these namespaced tags:
+  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety)
+  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
+  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata)
+  status/{status}    — Document state: active, draft, archived
+  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
+  company/{slug}     — Company-specific context
+  person/{slug}      — Person-specific context
+
+SLUG CONVENTIONS — kebab-case, descriptive:
+  "thesis" — main investment thesis
+  "sources" — data source registry
+  "scoring-criteria-{industry}" — industry-specific scoring
+  "template-{type}" — reusable templates (e.g. template-memo, template-outreach)
+
+METADATA — use for structured fields that don't fit in tags:
+  { version: "2.0", revenue_range: "$2M-$70M", last_editor: "dino" }`,
+    {
+      slug: z
+        .string()
+        .describe("Unique kebab-case identifier (e.g. 'thesis', 'sources', 'scoring-criteria-cybersecurity')"),
+      title: z
+        .string()
+        .describe("Human-readable title"),
+      content: z
+        .string()
+        .describe("Full document content in markdown"),
+      doc_type: z
+        .enum(["thesis", "reference", "source", "criteria", "template"])
+        .default("reference")
+        .describe("Document type: thesis (investment thesis), reference (general), source (data source registry), criteria (scoring/evaluation), template (reusable format)"),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Namespaced tags for queryability. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}. Always include at least status/active and relevant skill/ or topic/ tags."),
+      metadata: z
+        .record(z.unknown())
+        .optional()
+        .describe("Structured key-value data. Use for version, revenue ranges, editor info, or anything skill-specific that needs to be machine-readable."),
+    },
+    async ({ slug, title, content, doc_type, tags, metadata }) => {
+      const denied = requireAuth("update_context");
+      if (denied) return denied;
+
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ saved: false, error: "Database not configured" }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      try {
+        const tagArray = tags ?? [];
+        const meta = metadata ? JSON.stringify(metadata) : '{}';
+
+        const rows = await sql`
+          INSERT INTO wl_context (slug, doc_type, title, content, tags, metadata, updated_by)
+          VALUES (${slug}, ${doc_type}, ${title}, ${content}, ${tagArray}, ${meta}::jsonb, 'claude')
+          ON CONFLICT (slug) DO UPDATE SET
+            doc_type = EXCLUDED.doc_type,
+            title = EXCLUDED.title,
+            content = EXCLUDED.content,
+            tags = EXCLUDED.tags,
+            metadata = EXCLUDED.metadata,
+            updated_by = EXCLUDED.updated_by,
+            updated_at = now()
+          RETURNING id, slug, doc_type, title, tags, updated_at
+        `;
+
+        const row = (rows as Record<string, unknown>[])[0];
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  saved: true,
+                  ...row,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
   // -- admin_report -----------------------------------------------------------
   server.tool(
     "admin_report",
