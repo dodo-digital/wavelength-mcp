@@ -21,7 +21,44 @@ export interface ServerContext {
     status: "success" | "error" | "partial";
     error_message?: string;
     duration_ms: number;
+    details?: Record<string, unknown>;
   }) => Promise<void>;
+}
+
+// -- Row types for context tools --------------------------------------------
+
+interface ContextRow {
+  id: string;
+  slug: string;
+  doc_type: string;
+  title: string;
+  content?: string;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  version: number;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface ContextHistoryRow {
+  version: number;
+  change_type: string;
+  changed_by: string | null;
+  title: string;
+  tags: string[];
+  created_at: string;
+}
+
+interface UpsertResultRow {
+  id: string;
+  slug: string;
+  doc_type: string;
+  title: string;
+  tags: string[];
+  version: number;
+  updated_at: string;
+  change_type: "created" | "updated";
 }
 
 export function createServer(ctx?: ServerContext): McpServer {
@@ -1295,6 +1332,345 @@ export function createServer(ctx?: ServerContext): McpServer {
           isError: true,
         };
       }
+    }
+  );
+
+  // -- query_context ----------------------------------------------------------
+  server.tool(
+    "query_context",
+    `Search shared context documents (thesis, sources, scoring criteria, templates, etc.). Returns matching documents by slug, doc_type, tags, or full-text keyword search. Use this at the start of skill runs to load the latest thesis, scoring criteria, or any shared reference material.
+
+TAG TAXONOMY — use these namespaced tags for querying:
+  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety, industry/dental-it)
+  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
+  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata, source/apollo)
+  status/{status}    — Document state (e.g. status/active, status/draft, status/archived)
+  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
+  company/{slug}     — Company-specific context (e.g. company/acme-security)
+  person/{slug}      — Person-specific context (e.g. person/dino-bebeslic)
+
+Query examples:
+  slug: "thesis" → get the investment thesis (includes version number)
+  tags: ["industry/cybersecurity"] → all context for cybersecurity deals
+  tags: ["skill/deal-analysis"] → everything deal-analysis needs
+  doc_type: "source" → all data source registries
+  keyword: "EBITDA margin" → full-text search
+
+When called with no parameters, returns a summary index (no content) to save tokens. Use slug to fetch full document.
+Set include_history: true to see edit history for a document.`,
+    {
+      slug: z
+        .string()
+        .optional()
+        .describe("Exact slug to retrieve (e.g. 'thesis', 'sources'). Returns one document with full content."),
+      doc_type: z
+        .string()
+        .optional()
+        .describe("Filter by document type: 'thesis', 'reference', 'source', 'criteria', 'template'"),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Filter by namespaced tags — returns docs matching ANY tag. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}"),
+      keyword: z
+        .string()
+        .optional()
+        .describe("Full-text search across title and content"),
+      include_history: z
+        .boolean()
+        .optional()
+        .describe("Include edit history (version log with who changed what and when). Only works with slug lookup."),
+    },
+    async ({ slug, doc_type, tags, keyword, include_history }) => {
+      const denied = requireAuth("query_context");
+      if (denied) return denied;
+
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ documents: [], note: "Database not configured" }, null, 2),
+            },
+          ],
+        };
+      }
+
+      const start = Date.now();
+      let result: { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+      let logDetails: Record<string, unknown> = {
+        query: { slug, doc_type, tags, keyword, include_history },
+      };
+
+      try {
+        let payload: Record<string, unknown>;
+
+        // Path 1: Exact slug lookup (with optional history)
+        if (slug) {
+          const rows = (await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, version, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE slug = ${slug}
+            LIMIT 1
+          `) as ContextRow[];
+
+          if (include_history && rows.length > 0) {
+            const history = (await sql`
+              SELECT version, change_type, changed_by, title, tags, created_at
+              FROM wl_context_history
+              WHERE slug = ${slug}
+              ORDER BY version DESC
+              LIMIT 20
+            `) as ContextHistoryRow[];
+
+            payload = { count: 1, documents: rows, history };
+          } else {
+            payload = { count: rows.length, documents: rows };
+          }
+
+          logDetails.result_count = rows.length;
+          logDetails.slugs = rows.map((r) => r.slug);
+        } else if (keyword?.trim() || (tags && tags.length > 0) || doc_type) {
+          // Path 2: Composable search (keyword + tags + doc_type — any combination)
+          const rows = (await sql`
+            SELECT id, slug, doc_type, title, content, tags, metadata, version, updated_by, created_at, updated_at
+            FROM wl_context
+            WHERE true
+              ${keyword?.trim() ? sql`AND to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '')) @@ plainto_tsquery('english', ${keyword.trim()})` : sql``}
+              ${tags && tags.length > 0 ? sql`AND tags && ${tags}` : sql``}
+              ${doc_type ? sql`AND doc_type = ${doc_type}` : sql``}
+            ORDER BY updated_at DESC
+            LIMIT 20
+          `) as ContextRow[];
+
+          payload = { count: rows.length, documents: rows };
+          logDetails.result_count = rows.length;
+          logDetails.slugs = rows.map((r) => r.slug);
+        } else {
+          // Path 3: List all — summary only (no content) to save tokens
+          const rows = (await sql`
+            SELECT id, slug, doc_type, title, tags, metadata, version, updated_by, created_at, updated_at
+            FROM wl_context
+            ORDER BY updated_at DESC
+            LIMIT 50
+          `) as ContextRow[];
+
+          payload = { count: rows.length, documents: rows };
+          logDetails.result_count = rows.length;
+          logDetails.slugs = rows.map((r) => r.slug);
+        }
+
+        result = { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }] };
+      } catch (err) {
+        result = {
+          content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+
+      if (ctx?.onToolCall) {
+        ctx.onToolCall({
+          tool: "query_context",
+          provider: undefined,
+          email_count: 0,
+          credits_used: 0,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
+          duration_ms: Date.now() - start,
+          details: logDetails,
+        }).catch(() => {});
+      }
+
+      return result;
+    }
+  );
+
+  // -- update_context ---------------------------------------------------------
+  server.tool(
+    "update_context",
+    `Create or update a shared context document. Upserts by slug — if a document with this slug exists, it updates (and snapshots the previous version to history); otherwise creates a new one. Every edit is tracked with who made the change, the version number, and a timestamp. Use query_context with include_history: true to see the edit log.
+
+TAG TAXONOMY — always tag documents with these namespaced tags:
+  industry/{slug}    — Target industry (e.g. industry/cybersecurity, industry/fire-safety)
+  skill/{slug}       — Which skill uses this (e.g. skill/deal-analysis, skill/grata-search-enrichment)
+  source/{slug}      — Data source (e.g. source/hubspot, source/onedrive, source/grata)
+  status/{status}    — Document state: active, draft, archived
+  topic/{slug}       — Subject matter (e.g. topic/scoring, topic/outreach, topic/thesis)
+  company/{slug}     — Company-specific context
+  person/{slug}      — Person-specific context
+
+SLUG CONVENTIONS — kebab-case, descriptive:
+  "thesis" — main investment thesis
+  "sources" — data source registry
+  "scoring-criteria-{industry}" — industry-specific scoring
+  "template-{type}" — reusable templates (e.g. template-memo, template-outreach)
+
+METADATA — use for structured fields that don't fit in tags:
+  { revenue_range: "$2M-$70M", sectors: ["cybersecurity", "fire-safety"] }`,
+    {
+      slug: z
+        .string()
+        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Slug must be kebab-case (e.g. 'thesis', 'scoring-criteria-cybersecurity')")
+        .describe("Unique kebab-case identifier (e.g. 'thesis', 'sources', 'scoring-criteria-cybersecurity')"),
+      title: z
+        .string()
+        .describe("Human-readable title"),
+      content: z
+        .string()
+        .min(1, "Content cannot be empty")
+        .describe("Full document content in markdown"),
+      doc_type: z
+        .enum(["thesis", "reference", "source", "criteria", "template"])
+        .optional()
+        .describe("Document type: thesis (investment thesis), reference (general), source (data source registry), criteria (scoring/evaluation), template (reusable format). Defaults to 'reference' for new documents. Omit on update to preserve existing type."),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Namespaced tags for queryability. Use: industry/{slug}, skill/{slug}, source/{slug}, status/{status}, topic/{slug}, company/{slug}, person/{slug}. Always include at least status/active and relevant skill/ or topic/ tags. When omitted on update, existing tags are preserved."),
+      metadata: z
+        .record(z.unknown())
+        .optional()
+        .describe("Structured key-value data. When omitted on update, existing metadata is preserved."),
+    },
+    async ({ slug, title, content, doc_type, tags, metadata }) => {
+      const denied = requireAuth("update_context");
+      if (denied) return denied;
+
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ saved: false, error: "Database not configured" }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const editor = ctx?.userId ?? "claude";
+      const tagArray = tags ?? null;
+      const meta = metadata ? JSON.stringify(metadata) : null;
+      const docType = doc_type ?? null;
+
+      const start = Date.now();
+      let result: { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+      let logDetails: Record<string, unknown> = {
+        input: { slug, title, doc_type: docType, tags: tagArray, has_metadata: meta !== null },
+      };
+
+      try {
+        // Atomic CTE: snapshot → upsert → creation log in one round-trip.
+        // ON CONFLICT UPDATE reads the locked row's version, eliminating race conditions.
+        const rows = (await sql`
+          WITH prev AS (
+            SELECT id, slug, version, doc_type, title, content, tags, metadata, updated_by
+            FROM wl_context
+            WHERE slug = ${slug}
+            LIMIT 1
+          ),
+          snapshot AS (
+            INSERT INTO wl_context_history (context_id, slug, version, doc_type, title, content, tags, metadata, changed_by, change_type)
+            SELECT id, slug, version, doc_type, title, content, tags, metadata, updated_by, 'updated'
+            FROM prev
+            RETURNING context_id
+          ),
+          upserted AS (
+            INSERT INTO wl_context (slug, doc_type, title, content, tags, metadata, updated_by, version)
+            VALUES (
+              ${slug},
+              COALESCE(${docType}, 'reference'),
+              ${title},
+              ${content},
+              COALESCE(${tagArray}, '{}'),
+              COALESCE(${meta}, '{}')::jsonb,
+              ${editor},
+              COALESCE((SELECT version FROM prev), 0) + 1
+            )
+            ON CONFLICT (slug) DO UPDATE SET
+              doc_type = ${docType ? sql`EXCLUDED.doc_type` : sql`wl_context.doc_type`},
+              title = EXCLUDED.title,
+              content = EXCLUDED.content,
+              tags = ${tagArray !== null ? sql`EXCLUDED.tags` : sql`wl_context.tags`},
+              metadata = ${meta !== null ? sql`EXCLUDED.metadata` : sql`wl_context.metadata`},
+              updated_by = EXCLUDED.updated_by,
+              version = wl_context.version + 1,
+              updated_at = now()
+            RETURNING id, slug, doc_type, title, tags, version, updated_at
+          ),
+          creation_log AS (
+            INSERT INTO wl_context_history (context_id, slug, version, doc_type, title, content, tags, metadata, changed_by, change_type)
+            SELECT id, slug, version, doc_type, title, ${content}, tags, ${meta ?? '{}'}::jsonb, ${editor}, 'created'
+            FROM upserted
+            WHERE NOT EXISTS (SELECT 1 FROM prev)
+            RETURNING context_id
+          )
+          SELECT u.*,
+            CASE WHEN EXISTS (SELECT 1 FROM prev) THEN 'updated' ELSE 'created' END AS change_type
+          FROM upserted u
+        `) as UpsertResultRow[];
+
+        const row = rows[0];
+
+        if (!row) {
+          result = {
+            content: [{ type: "text" as const, text: JSON.stringify({ saved: false, error: "Upsert returned no rows" }, null, 2) }],
+            isError: true,
+          };
+        } else {
+          logDetails.result = {
+            change_type: row.change_type,
+            version: row.version,
+            slug: row.slug,
+            doc_type: row.doc_type,
+          };
+
+          result = {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    saved: true,
+                    change_type: row.change_type,
+                    version: row.version,
+                    changed_by: editor,
+                    id: row.id,
+                    slug: row.slug,
+                    doc_type: row.doc_type,
+                    title: row.title,
+                    tags: row.tags,
+                    updated_at: row.updated_at,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+      } catch (err) {
+        result = {
+          content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+          isError: true,
+        };
+      }
+
+      if (ctx?.onToolCall) {
+        ctx.onToolCall({
+          tool: "update_context",
+          provider: undefined,
+          email_count: 0,
+          credits_used: 0,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
+          duration_ms: Date.now() - start,
+          details: logDetails,
+        }).catch(() => {});
+      }
+
+      return result;
     }
   );
 
