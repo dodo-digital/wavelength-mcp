@@ -1468,16 +1468,18 @@ Set include_history: true to see edit history for a document.`,
         };
       }
 
-      ctx?.onToolCall?.({
-        tool: "query_context",
-        provider: undefined,
-        email_count: 0,
-        credits_used: 0,
-        status: result.isError ? "error" : "success",
-        error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
-        duration_ms: Date.now() - start,
-        details: logDetails,
-      }).catch(() => {});
+      if (ctx?.onToolCall) {
+        ctx.onToolCall({
+          tool: "query_context",
+          provider: undefined,
+          email_count: 0,
+          credits_used: 0,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
+          duration_ms: Date.now() - start,
+          details: logDetails,
+        }).catch(() => {});
+      }
 
       return result;
     }
@@ -1611,36 +1613,43 @@ METADATA — use for structured fields that don't fit in tags:
 
         const row = rows[0];
 
-        logDetails.result = {
-          change_type: row.change_type,
-          version: row.version,
-          slug: row.slug,
-          doc_type: row.doc_type,
-        };
+        if (!row) {
+          result = {
+            content: [{ type: "text" as const, text: JSON.stringify({ saved: false, error: "Upsert returned no rows" }, null, 2) }],
+            isError: true,
+          };
+        } else {
+          logDetails.result = {
+            change_type: row.change_type,
+            version: row.version,
+            slug: row.slug,
+            doc_type: row.doc_type,
+          };
 
-        result = {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  saved: true,
-                  change_type: row.change_type,
-                  version: row.version,
-                  changed_by: editor,
-                  id: row.id,
-                  slug: row.slug,
-                  doc_type: row.doc_type,
-                  title: row.title,
-                  tags: row.tags,
-                  updated_at: row.updated_at,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+          result = {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    saved: true,
+                    change_type: row.change_type,
+                    version: row.version,
+                    changed_by: editor,
+                    id: row.id,
+                    slug: row.slug,
+                    doc_type: row.doc_type,
+                    title: row.title,
+                    tags: row.tags,
+                    updated_at: row.updated_at,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
       } catch (err) {
         result = {
           content: [{ type: "text" as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
@@ -1648,16 +1657,18 @@ METADATA — use for structured fields that don't fit in tags:
         };
       }
 
-      ctx?.onToolCall?.({
-        tool: "update_context",
-        provider: undefined,
-        email_count: 0,
-        credits_used: 0,
-        status: result.isError ? "error" : "success",
-        error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
-        duration_ms: Date.now() - start,
-        details: logDetails,
-      }).catch(() => {});
+      if (ctx?.onToolCall) {
+        ctx.onToolCall({
+          tool: "update_context",
+          provider: undefined,
+          email_count: 0,
+          credits_used: 0,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
+          duration_ms: Date.now() - start,
+          details: logDetails,
+        }).catch(() => {});
+      }
 
       return result;
     }
