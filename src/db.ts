@@ -12,6 +12,7 @@ export interface CallLogEntry {
   status: "success" | "error" | "partial";
   error_message?: string;
   duration_ms: number;
+  details?: Record<string, unknown>;
 }
 
 export interface HealthCheckResult {
@@ -67,7 +68,7 @@ export async function logCall(
   entry: CallLogEntry
 ): Promise<void> {
   await sql`
-    INSERT INTO wl_calls (user_id, tool, provider, email_count, credits_used, status, error_message, duration_ms)
+    INSERT INTO wl_calls (user_id, tool, provider, email_count, credits_used, status, error_message, duration_ms, details)
     VALUES (
       ${userId},
       ${entry.tool},
@@ -76,7 +77,8 @@ export async function logCall(
       ${entry.credits_used},
       ${entry.status},
       ${entry.error_message ?? null},
-      ${entry.duration_ms}
+      ${entry.duration_ms},
+      ${entry.details ? JSON.stringify(entry.details) : null}
     )
   `;
 }
