@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { fetchWithTimeout } from "./fetch.js";
 
 const CLEAROUT_BASE = "https://api.clearout.io/v2";
 
@@ -90,6 +91,22 @@ export function isCreditExhausted(errorMsg: string): boolean {
   );
 }
 
+function clearoutErrorMessage(status: number, body: string): string {
+  if (status === 402 || isCreditExhausted(body)) {
+    return "Clearout API 402: credits exhausted";
+  }
+  if (status === 429) return "Clearout API 429: rate limited";
+  if (status === 401 || status === 403) return "Clearout API authentication failed";
+  return `Clearout API ${status}: request failed`;
+}
+
+function clearoutProviderError(message?: string): string {
+  if (!message) return "Clearout request failed";
+  if (isCreditExhausted(message)) return "Clearout credits exhausted";
+  if (message.toLowerCase().includes("rate")) return "Clearout rate limited";
+  return "Clearout request failed";
+}
+
 export function extractAvailableCredits(
   credits: Record<string, unknown>
 ): number | null {
@@ -106,28 +123,26 @@ export function extractAvailableCredits(
 export async function verifyEmail(
   email: string
 ): Promise<ClearoutVerifyResult> {
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/instant`, {
+  const res = await fetchWithTimeout(`${CLEAROUT_BASE}/email_verify/instant`, {
     method: "POST",
     headers: {
       Authorization: `Bearer:${getKey()}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email, timeout: 130000 }),
-  });
+    body: JSON.stringify({ email, timeout: 55_000 }),
+  }, 60_000);
 
   const rateLimitRemaining = res.headers.get("x-ratelimit-remaining");
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Clearout API ${res.status}: ${body}`);
+    throw new Error(clearoutErrorMessage(res.status, body));
   }
 
   const json = VerifyResponseSchema.parse(await res.json());
 
   if (json.status === "error" || !json.data) {
-    throw new Error(
-      `Clearout error: ${json.error?.message ?? "Unknown error"}`
-    );
+    throw new Error(clearoutProviderError(json.error?.message));
   }
 
   const result: ClearoutVerifyResult = { ...json.data };
@@ -146,24 +161,22 @@ export async function verifyEmail(
 export async function getCredits(): Promise<{
   credits: Record<string, unknown>;
 }> {
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/getcredits`, {
+  const res = await fetchWithTimeout(`${CLEAROUT_BASE}/email_verify/getcredits`, {
     method: "GET",
     headers: {
       Authorization: `Bearer:${getKey()}`,
     },
-  });
+  }, 20_000);
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Clearout API ${res.status}: ${body}`);
+    throw new Error(clearoutErrorMessage(res.status, body));
   }
 
   const json = CreditResponseSchema.parse(await res.json());
 
   if (json.status === "error" || !json.data) {
-    throw new Error(
-      `Clearout error: ${json.error?.message ?? "Unknown error"}`
-    );
+    throw new Error(clearoutProviderError(json.error?.message));
   }
 
   return { credits: json.data.credits };
@@ -187,23 +200,21 @@ export async function bulkSubmit(emails: string[]): Promise<string> {
   );
   formData.append("optimize", "highest_accuracy");
 
-  const res = await fetch(`${CLEAROUT_BASE}/email_verify/bulk`, {
+  const res = await fetchWithTimeout(`${CLEAROUT_BASE}/email_verify/bulk`, {
     method: "POST",
     headers: { Authorization: `Bearer:${getKey()}` },
     body: formData,
-  });
+  }, 60_000);
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Clearout bulk API ${res.status}: ${body}`);
+    throw new Error(clearoutErrorMessage(res.status, body));
   }
 
   const json = BulkSubmitResponseSchema.parse(await res.json());
 
   if (json.status === "error" || !json.data?.list_id) {
-    throw new Error(
-      `Clearout bulk submit failed: ${json.error?.message ?? JSON.stringify(json)}`
-    );
+    throw new Error(clearoutProviderError(json.error?.message));
   }
 
   return json.data.list_id;
@@ -213,14 +224,15 @@ export async function bulkStatus(
   listId: string
 ): Promise<{ progress_status: string; percentile: number }> {
   const params = new URLSearchParams({ list_id: listId });
-  const res = await fetch(
+  const res = await fetchWithTimeout(
     `${CLEAROUT_BASE}/email_verify/bulk/progress_status?${params}`,
-    { headers: { Authorization: `Bearer:${getKey()}` } }
+    { headers: { Authorization: `Bearer:${getKey()}` } },
+    20_000
   );
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Clearout status API ${res.status}: ${body}`);
+    throw new Error(clearoutErrorMessage(res.status, body));
   }
 
   const json = BulkStatusResponseSchema.parse(await res.json());
@@ -232,29 +244,27 @@ export async function bulkStatus(
 }
 
 export async function bulkResults(listId: string): Promise<string> {
-  const res = await fetch(`${CLEAROUT_BASE}/download/result`, {
+  const res = await fetchWithTimeout(`${CLEAROUT_BASE}/download/result`, {
     method: "POST",
     headers: {
       Authorization: `Bearer:${getKey()}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({ list_id: listId }),
-  });
+  }, 30_000);
 
   if (!res.ok) {
     const body = await res.text();
-    throw new Error(`Clearout download API ${res.status}: ${body}`);
+    throw new Error(clearoutErrorMessage(res.status, body));
   }
 
   const json = BulkDownloadResponseSchema.parse(await res.json());
 
   if (json.status === "error" || !json.data?.url) {
-    throw new Error(
-      `Clearout download failed: ${json.error?.message ?? "no URL returned"}`
-    );
+    throw new Error(clearoutProviderError(json.error?.message));
   }
 
-  const fileRes = await fetch(json.data.url);
+  const fileRes = await fetchWithTimeout(json.data.url, {}, 60_000);
   if (!fileRes.ok) {
     throw new Error(`Failed to download results file: ${fileRes.status}`);
   }

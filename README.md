@@ -70,9 +70,9 @@ npm run dev                        # local dev server
 | `CLEAROUT_API_KEY` | Yes | Clearout email validation |
 | `ZEROBOUNCE_API_KEY` | Yes | ZeroBounce email validation |
 | `APOLLO_API_KEY` | Yes | Apollo enrichment |
-| `REPLY_API_KEY` | Yes | Reply.io outreach |
+| `REPLY_IO_API_KEY` | Yes | Reply.io outreach |
 | `POSTGRES_URL` | Yes | Neon connection string |
-| `BETTER_AUTH_SECRET` | Yes | OAuth 2.1 session signing |
+| `AUTH_SECRET` | Yes | OAuth 2.1 session signing |
 | `BETTER_AUTH_URL` | Yes | Server base URL |
 
 ## Database
@@ -88,7 +88,11 @@ Migrations in `migrations/` — run sequentially against Neon:
 006_context_history.sql — wl_context_history for version tracking
 007_context_integrity.sql — ON DELETE RESTRICT, unique version index
 008_call_details.sql  — JSONB details column on wl_calls
+009_admin_and_bulk_jobs.sql — admin flag and owned bulk job tracking
+010_context_history_triggers.sql — database-managed context history
 ```
+
+Admin-only tools require `wl_users.is_admin = true`. Set that manually for the users who should be able to run `admin_report`.
 
 ## Architecture
 

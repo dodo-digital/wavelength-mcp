@@ -1,5 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getSql, logHealthCheck } from "../src/db.js";
+import { fetchWithTimeout } from "../src/clients/fetch.js";
 
 // ---------------------------------------------------------------------------
 // Health check endpoint — runs via Vercel Cron every 4 hours
@@ -16,9 +17,9 @@ async function checkClearout(): Promise<{
   if (!key) return { status: "fail", details: { error: "CLEAROUT_API_KEY not set" } };
 
   try {
-    const res = await fetch(`${CLEAROUT_BASE}/email_verify/getcredits`, {
+    const res = await fetchWithTimeout(`${CLEAROUT_BASE}/email_verify/getcredits`, {
       headers: { Authorization: `Bearer:${key}` },
-    });
+    }, 20_000);
 
     if (!res.ok) {
       return {
@@ -61,7 +62,7 @@ async function checkZeroBounce(): Promise<{
 
   try {
     const params = new URLSearchParams({ api_key: key });
-    const res = await fetch(`${ZEROBOUNCE_BASE}/getcredits?${params}`);
+    const res = await fetchWithTimeout(`${ZEROBOUNCE_BASE}/getcredits?${params}`, {}, 20_000);
 
     if (!res.ok) {
       return {

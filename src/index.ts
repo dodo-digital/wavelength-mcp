@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { getSql } from "./db.js";
+import { createBulkJob, getBulkJob, getSql, markBulkJobExpired, updateBulkJobStatus } from "./db.js";
 import * as clearout from "./clients/clearout.js";
 import * as zerobounce from "./clients/zerobounce.js";
 import * as apollo from "./clients/apollo.js";
@@ -13,6 +13,7 @@ import { parseCsv } from "./utils/csv.js";
 
 export interface ServerContext {
   userId?: string | null;
+  isAdmin?: boolean;
   onToolCall?: (entry: {
     tool: string;
     provider?: string;
@@ -61,6 +62,22 @@ interface UpsertResultRow {
   change_type: "created" | "updated";
 }
 
+const SLUG_SCHEMA = z
+  .string()
+  .max(128, "Slug too long")
+  .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Kebab-case (e.g. 'thesis', 'scoring-criteria-cyber')");
+const SHORT_TEXT = z.string().max(500, "Text too long");
+const MEDIUM_TEXT = z.string().max(2_000, "Text too long");
+const LONG_TEXT = z.string().max(20_000, "Text too long");
+const JOB_ID = z.string().min(1).max(200, "Job ID too long");
+const DOMAIN = z.string().max(253, "Domain too long");
+const URL_TEXT = z.string().max(2_048, "URL too long");
+const TAG = z.string().max(200, "Tag too long");
+const metadataSchema = z.record(z.unknown()).refine(
+  (value) => JSON.stringify(value).length <= 50_000,
+  "Metadata exceeds 50KB limit"
+);
+
 export function createServer(ctx?: ServerContext): McpServer {
   const server = new McpServer({
     name: "wavelength",
@@ -81,6 +98,21 @@ export function createServer(ctx?: ServerContext): McpServer {
     };
   }
 
+  function requireAdmin(label: string) {
+    const denied = requireAuth(label);
+    if (denied) return denied;
+    if (ctx?.isAdmin) return null;
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: JSON.stringify({ error: `Admin access required for ${label}` }, null, 2),
+        },
+      ],
+      isError: true,
+    };
+  }
+
   // Tool result shape returned by handlers
   type ToolResult = {
     content: Array<{ type: "text"; text: string }>;
@@ -93,11 +125,17 @@ export function createServer(ctx?: ServerContext): McpServer {
     meta: {
       provider: string | null | ((args: T) => string | null);
       emailCount: (args: T) => number;
+      requiresAuth?: boolean;
     },
     handler: (args: T, extra: unknown) => Promise<ToolResult>
   ): (args: T, extra: unknown) => Promise<ToolResult> {
     return async (args: T, extra: any) => {
       const start = Date.now();
+      if (meta.requiresAuth !== false) {
+        const denied = requireAuth(tool);
+        if (denied) return denied;
+      }
+
       const result = await handler(args, extra);
 
       if (ctx?.onToolCall) {
@@ -510,10 +548,25 @@ export function createServer(ctx?: ServerContext): McpServer {
     tracked("bulk_validate", { provider: ({ provider }: any) => provider, emailCount: ({ emails }: any) => emails.length },
     async ({ provider, emails }) => {
       try {
+        const sql = getSql();
+        if (!sql || !ctx?.userId) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Authenticated database user required for bulk validation" }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+
         const jobId =
           provider === "clearout"
             ? await clearout.bulkSubmit(emails)
             : await zerobounce.bulkSubmit(emails);
+
+        await createBulkJob(sql, ctx.userId, provider, jobId, emails.length);
 
         return {
           content: [
@@ -553,11 +606,49 @@ export function createServer(ctx?: ServerContext): McpServer {
     "Check bulk validation job progress.",
     {
       provider: z.enum(["clearout", "zerobounce"]),
-      job_id: z.string().describe("job_id from bulk_validate"),
+      job_id: JOB_ID.describe("job_id from bulk_validate"),
     },
     tracked("bulk_status", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
       try {
+        const sql = getSql();
+        if (!sql || !ctx?.userId) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Authenticated database user required for bulk status" }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const job = await getBulkJob(sql, provider, job_id);
+        if (!job || job.user_id !== ctx.userId) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Bulk job not found" }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (job.status === "expired" || Date.parse(job.expires_at) <= Date.now()) {
+          await markBulkJobExpired(sql, provider, job_id);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Bulk job expired. Submit a new bulk_validate request." }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+
         let status: Record<string, unknown>;
 
         if (provider === "clearout") {
@@ -588,6 +679,8 @@ export function createServer(ctx?: ServerContext): McpServer {
           ? `Call bulk_results with provider="${provider}" and job_id="${job_id}" to download results.`
           : "Not complete yet. Check again in 30 seconds.";
 
+        await updateBulkJobStatus(sql, provider, job_id, String(status.status));
+
         return {
           content: [
             {
@@ -616,11 +709,49 @@ export function createServer(ctx?: ServerContext): McpServer {
     "Download completed bulk job results. Requires bulk_status is_complete: true.",
     {
       provider: z.enum(["clearout", "zerobounce"]),
-      job_id: z.string().describe("job_id from bulk_validate"),
+      job_id: JOB_ID.describe("job_id from bulk_validate"),
     },
     tracked("bulk_results", { provider: ({ provider }: any) => provider, emailCount: () => 0 },
     async ({ provider, job_id }) => {
       try {
+        const sql = getSql();
+        if (!sql || !ctx?.userId) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Authenticated database user required for bulk results" }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const job = await getBulkJob(sql, provider, job_id);
+        if (!job || job.user_id !== ctx.userId) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Bulk job not found" }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+        if (job.status === "expired" || Date.parse(job.expires_at) <= Date.now()) {
+          await markBulkJobExpired(sql, provider, job_id);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify({ error: "Bulk job expired. Submit a new bulk_validate request." }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
+
         const csvText =
           provider === "clearout"
             ? await clearout.bulkResults(job_id)
@@ -648,6 +779,8 @@ export function createServer(ctx?: ServerContext): McpServer {
             isError: true,
           };
         }
+
+        await updateBulkJobStatus(sql, provider, job_id, "downloaded");
 
         return {
           content: [
@@ -726,7 +859,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     "List Reply.io sequences. Filter by status.",
     {
       status: z.enum(["active", "paused", "new"]).optional(),
-      top: z.number().min(1).max(1000).optional().describe("Max results (default 100)"),
+      top: z.number().int().min(1).max(1000).optional().describe("Max results (default 100)"),
     },
     tracked("reply_list_sequences", { provider: "reply", emailCount: () => 0 },
     async ({ status, top }) => {
@@ -774,7 +907,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     "reply_get_sequence",
     "Get Reply.io sequence details (steps, templates, settings, linked accounts).",
     {
-      sequence_id: z.number(),
+      sequence_id: z.number().int().positive(),
     },
     tracked("reply_get_sequence", { provider: "reply", emailCount: () => 0 },
     async ({ sequence_id }) => {
@@ -846,22 +979,23 @@ export function createServer(ctx?: ServerContext): McpServer {
     "reply_push_contacts",
     "Upsert + push ≤50 contacts to a Reply.io sequence. Confirm with user first.",
     {
-      sequence_id: z.number(),
+      sequence_id: z.number().int().positive(),
       contacts: z
         .array(
           z.object({
             email: z.string().email(),
-            firstName: z.string(),
-            lastName: z.string().optional(),
-            title: z.string().optional(),
-            company: z.string().optional(),
-            city: z.string().optional(),
-            state: z.string().optional(),
-            country: z.string().optional(),
-            phone: z.string().optional(),
-            linkedInProfile: z.string().optional(),
+            firstName: SHORT_TEXT,
+            lastName: SHORT_TEXT.optional(),
+            title: SHORT_TEXT.optional(),
+            company: SHORT_TEXT.optional(),
+            city: SHORT_TEXT.optional(),
+            state: SHORT_TEXT.optional(),
+            country: SHORT_TEXT.optional(),
+            phone: SHORT_TEXT.optional(),
+            linkedInProfile: URL_TEXT.optional(),
             customFields: z
-              .array(z.object({ key: z.string(), value: z.string() }))
+              .array(z.object({ key: z.string().max(100), value: MEDIUM_TEXT }))
+              .max(50)
               .optional(),
           })
         )
@@ -908,14 +1042,10 @@ export function createServer(ctx?: ServerContext): McpServer {
           if (res.status >= 200 && res.status < 300) {
             return { email: contact.email, status: "added" };
           }
-          const errMsg =
-            typeof res.body === "object" && res.body !== null
-              ? JSON.stringify(res.body)
-              : String(res.body);
           return {
             email: contact.email,
             status: "error",
-            error: `HTTP ${res.status}: ${errMsg}`,
+            error: `Reply.io API ${res.status}: request failed`,
           };
         } catch (err) {
           return {
@@ -967,11 +1097,11 @@ export function createServer(ctx?: ServerContext): McpServer {
     "apollo_enrich_person",
     "Apollo person enrichment by email, LinkedIn URL, or name+company. 1 credit.",
     {
-      email: z.string().optional(),
-      linkedin_url: z.string().optional(),
-      first_name: z.string().optional().describe("Use with last_name + organization_name"),
-      last_name: z.string().optional(),
-      organization_name: z.string().optional(),
+      email: z.string().email().optional(),
+      linkedin_url: URL_TEXT.optional(),
+      first_name: SHORT_TEXT.optional().describe("Use with last_name + organization_name"),
+      last_name: SHORT_TEXT.optional(),
+      organization_name: SHORT_TEXT.optional(),
     },
     tracked("apollo_enrich_person", { provider: "apollo", emailCount: () => 1 },
     async (args) => {
@@ -1020,11 +1150,11 @@ export function createServer(ctx?: ServerContext): McpServer {
       details: z
         .array(
           z.object({
-            email: z.string().optional(),
-            linkedin_url: z.string().optional(),
-            first_name: z.string().optional(),
-            last_name: z.string().optional(),
-            organization_name: z.string().optional(),
+            email: z.string().email().optional(),
+            linkedin_url: URL_TEXT.optional(),
+            first_name: SHORT_TEXT.optional(),
+            last_name: SHORT_TEXT.optional(),
+            organization_name: SHORT_TEXT.optional(),
           })
         )
         .min(1)
@@ -1075,7 +1205,7 @@ export function createServer(ctx?: ServerContext): McpServer {
     "apollo_enrich_org",
     "Apollo company enrichment by domain.",
     {
-      domain: z.string().describe("e.g. 'wavelengthequity.com'"),
+      domain: DOMAIN.describe("e.g. 'wavelengthequity.com'"),
     },
     tracked("apollo_enrich_org", { provider: "apollo", emailCount: () => 0 },
     async ({ domain }) => {
@@ -1105,11 +1235,11 @@ export function createServer(ctx?: ServerContext): McpServer {
     "apollo_search_people",
     "Search Apollo people database. 25 results/page.",
     {
-      organization_domains: z.array(z.string()).optional(),
-      person_titles: z.array(z.string()).optional().describe("e.g. ['CEO', 'Founder']"),
-      person_seniorities: z.array(z.string()).optional().describe("owner, founder, c_suite, partner, vp, director, manager"),
-      person_locations: z.array(z.string()).optional(),
-      page: z.number().optional(),
+      organization_domains: z.array(DOMAIN).max(100).optional(),
+      person_titles: z.array(SHORT_TEXT).max(100).optional().describe("e.g. ['CEO', 'Founder']"),
+      person_seniorities: z.array(SHORT_TEXT).max(50).optional().describe("owner, founder, c_suite, partner, vp, director, manager"),
+      person_locations: z.array(SHORT_TEXT).max(100).optional(),
+      page: z.number().int().min(1).max(1000).optional(),
     },
     tracked("apollo_search_people", { provider: "apollo", emailCount: () => 0 },
     async (args) => {
@@ -1142,8 +1272,8 @@ export function createServer(ctx?: ServerContext): McpServer {
     "get_skill_learnings",
     "Load skill learnings (cross-user knowledge). Call at start of every skill run.",
     {
-      skill: z.string().describe("e.g. 'company-processor', 'grata-search-enrichment'"),
-      industry: z.string().optional().describe("e.g. 'cybersecurity'. Omit for all."),
+      skill: SHORT_TEXT.describe("e.g. 'company-processor', 'grata-search-enrichment'"),
+      industry: SHORT_TEXT.optional().describe("e.g. 'cybersecurity'. Omit for all."),
     },
     async ({ skill, industry }) => {
       const denied = requireAuth("get_skill_learnings");
@@ -1218,12 +1348,12 @@ export function createServer(ctx?: ServerContext): McpServer {
     "save_skill_learning",
     "Save one actionable learning (visible to all users). Use for calibration, schema changes, edge cases, patterns.",
     {
-      skill: z.string().describe("e.g. 'company-processor'"),
-      industry: z.string().optional().describe("Omit for global learnings"),
+      skill: SHORT_TEXT.describe("e.g. 'company-processor'"),
+      industry: SHORT_TEXT.optional().describe("Omit for global learnings"),
       category: z
         .enum(["adjustment", "schema-change", "edge-case", "pattern"])
         .default("adjustment"),
-      content: z.string().describe("Specific, actionable insight"),
+      content: LONG_TEXT.describe("Specific, actionable insight"),
     },
     async ({ skill, industry, category, content }) => {
       const denied = requireAuth("save_skill_learning");
@@ -1290,9 +1420,9 @@ export function createServer(ctx?: ServerContext): McpServer {
     "query_context",
     "Search shared context docs. By slug (full doc), doc_type, tags, keyword (full-text), or no params (summary index). Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces. include_history with slug for edit log.",
     {
-      slug: z.string().optional().describe("Exact slug for full doc (e.g. 'thesis')"),
-      doc_type: z.string().optional().describe("thesis, reference, source, criteria, template"),
-      tags: z.array(z.string().max(200)).max(50).optional().describe("Namespaced tags (matches ANY)"),
+      slug: z.string().max(128, "Slug too long").optional().describe("Exact slug for full doc (e.g. 'thesis')"),
+      doc_type: z.enum(["thesis", "reference", "source", "criteria", "template"]).optional(),
+      tags: z.array(TAG).max(50).optional().describe("Namespaced tags (matches ANY)"),
       keyword: z.string().max(500, "Keyword too long").optional(),
       include_history: z.boolean().optional().describe("Edit log (slug lookup only)"),
     },
@@ -1407,22 +1537,19 @@ export function createServer(ctx?: ServerContext): McpServer {
     "update_context",
     "Upsert context doc by slug. Snapshots previous version to history. Tracks editor, version, timestamp. Omitting doc_type/tags/metadata on update preserves existing values. Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces.",
     {
-      slug: z
-        .string()
-        .max(128, "Slug too long")
-        .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, "Kebab-case (e.g. 'thesis', 'scoring-criteria-cyber')"),
-      title: z.string().max(500, "Title too long"),
+      slug: SLUG_SCHEMA,
+      title: SHORT_TEXT,
       content: z.string().min(1).max(100000, "Content exceeds 100KB limit").describe("Markdown"),
       doc_type: z
         .enum(["thesis", "reference", "source", "criteria", "template"])
         .optional()
         .describe("Defaults to 'reference' for new docs. Omit to preserve."),
       tags: z
-        .array(z.string().max(200, "Tag too long"))
+        .array(TAG)
         .max(50, "Too many tags")
         .optional()
         .describe("Omit to preserve existing"),
-      metadata: z.record(z.unknown()).optional().describe("Omit to preserve existing"),
+      metadata: metadataSchema.optional().describe("Omit to preserve existing"),
     },
     async ({ slug, title, content, doc_type, tags, metadata }) => {
       const denied = requireAuth("update_context");
@@ -1442,7 +1569,8 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       const editor = ctx?.userId ?? "claude";
-      const tagArray = tags ?? null;
+      const tagArray = tags ?? [];
+      const tagsProvided = tags !== undefined;
       const meta = metadata ? JSON.stringify(metadata) : null;
       const docType = doc_type ?? null;
 
@@ -1453,54 +1581,41 @@ export function createServer(ctx?: ServerContext): McpServer {
       };
 
       try {
-        // Atomic CTE: snapshot → upsert → creation log in one round-trip.
-        // ON CONFLICT UPDATE reads the locked row's version, eliminating race conditions.
         const rows = (await sql`
-          WITH prev AS (
-            SELECT id, slug, version, doc_type, title, content, tags, metadata, updated_by
-            FROM wl_context
-            WHERE slug = ${slug}
-            LIMIT 1
-          ),
-          snapshot AS (
-            INSERT INTO wl_context_history (context_id, slug, version, doc_type, title, content, tags, metadata, changed_by, change_type)
-            SELECT id, slug, version, doc_type, title, content, tags, metadata, updated_by, 'updated'
-            FROM prev
-            RETURNING context_id
-          ),
-          upserted AS (
+          WITH upserted AS (
             INSERT INTO wl_context (slug, doc_type, title, content, tags, metadata, updated_by, version)
             VALUES (
               ${slug},
               COALESCE(${docType}, 'reference'),
               ${title},
               ${content},
-              COALESCE(${tagArray}, '{}'),
+              ${tagArray},
               COALESCE(${meta}, '{}')::jsonb,
               ${editor},
-              COALESCE((SELECT version FROM prev), 0) + 1
+              1
             )
             ON CONFLICT (slug) DO UPDATE SET
               doc_type = ${docType ? sql`EXCLUDED.doc_type` : sql`wl_context.doc_type`},
               title = EXCLUDED.title,
               content = EXCLUDED.content,
-              tags = ${tagArray !== null ? sql`EXCLUDED.tags` : sql`wl_context.tags`},
+              tags = ${tagsProvided ? sql`EXCLUDED.tags` : sql`wl_context.tags`},
               metadata = ${meta !== null ? sql`EXCLUDED.metadata` : sql`wl_context.metadata`},
               updated_by = EXCLUDED.updated_by,
               version = wl_context.version + 1,
               updated_at = now()
-            RETURNING id, slug, doc_type, title, tags, version, updated_at
+            RETURNING id, slug, doc_type, title, content, tags, metadata, updated_by, version, updated_at
           ),
           creation_log AS (
             INSERT INTO wl_context_history (context_id, slug, version, doc_type, title, content, tags, metadata, changed_by, change_type)
-            SELECT id, slug, version, doc_type, title, ${content}, tags, ${meta ?? '{}'}::jsonb, ${editor}, 'created'
+            SELECT id, slug, version, doc_type, title, content, tags, metadata, updated_by, 'created'
             FROM upserted
-            WHERE NOT EXISTS (SELECT 1 FROM prev)
+            WHERE version = 1
+            ON CONFLICT (context_id, version) DO NOTHING
             RETURNING context_id
           )
-          SELECT u.*,
-            CASE WHEN EXISTS (SELECT 1 FROM prev) THEN 'updated' ELSE 'created' END AS change_type
-          FROM upserted u
+          SELECT id, slug, doc_type, title, tags, version, updated_at,
+            CASE WHEN version = 1 THEN 'created' ELSE 'updated' END AS change_type
+          FROM upserted
         `) as UpsertResultRow[];
 
         const row = rows[0];
@@ -1547,7 +1662,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         const isDuplicateVersion = err instanceof Error && err.message.includes("idx_wl_context_history_unique_version");
         result = {
           content: [{ type: "text" as const, text: JSON.stringify({
-            error: isDuplicateVersion ? "Concurrent edit detected — retry your update" : "Update failed",
+            error: isDuplicateVersion ? "Context history conflict detected — retry your update" : "Update failed",
             ...(isDuplicateVersion ? { retry: true } : {}),
           }, null, 2) }],
           isError: true,
@@ -1579,7 +1694,7 @@ export function createServer(ctx?: ServerContext): McpServer {
       days: z.number().min(1).max(90).optional().describe("Lookback days (default 7)"),
     },
     async ({ days }) => {
-      const denied = requireAuth("admin_report");
+      const denied = requireAdmin("admin_report");
       if (denied) return denied;
 
       const lookback = days ?? 7;

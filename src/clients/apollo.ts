@@ -1,3 +1,5 @@
+import { fetchWithTimeout } from "./fetch.js";
+
 const APOLLO_BASE = "https://api.apollo.io/api/v1";
 
 function getKey(): string {
@@ -10,28 +12,28 @@ export async function post(
   path: string,
   body: Record<string, unknown>
 ): Promise<unknown> {
-  const res = await fetch(`${APOLLO_BASE}${path}`, {
+  const res = await fetchWithTimeout(`${APOLLO_BASE}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "X-Api-Key": getKey(),
     },
     body: JSON.stringify(body),
-  });
+  }, 30_000);
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Apollo API ${res.status}: ${text}`);
+    await res.text();
+    throw new Error(`Apollo API ${res.status}: request failed`);
   }
   return res.json();
 }
 
 export async function get(path: string): Promise<unknown> {
-  const res = await fetch(`${APOLLO_BASE}${path}`, {
+  const res = await fetchWithTimeout(`${APOLLO_BASE}${path}`, {
     headers: { "X-Api-Key": getKey() },
-  });
+  }, 30_000);
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Apollo API ${res.status}: ${text}`);
+    await res.text();
+    throw new Error(`Apollo API ${res.status}: request failed`);
   }
   return res.json();
 }

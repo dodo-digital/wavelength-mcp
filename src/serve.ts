@@ -39,7 +39,7 @@ app.get("/mcp", (_req, res) => {
 // MCP endpoint
 app.post("/mcp", async (req, res) => {
   try {
-    const server = createServer();
+    const server = createServer({ userId: "local-dev", isAdmin: true });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });

@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "../src/index.js";
-import { getSql, resolveUser, logCall } from "../src/db.js";
+import { getSql, resolveUser, logCall, upsertOAuthUser, upsertSharedTokenUser } from "../src/db.js";
 import { auth } from "../src/auth.js";
 
 // ---------------------------------------------------------------------------
@@ -11,20 +11,13 @@ import { auth } from "../src/auth.js";
 interface AuthResult {
   authenticated: boolean;
   userId: string | null;
+  isAdmin: boolean;
   token: string;
 }
 
 function extractToken(req: VercelRequest): string | null {
-  // 1. Bearer header (Claude Code / .mcp.json)
   const header = req.headers.authorization;
   if (header?.startsWith("Bearer ")) return header.slice(7);
-
-  // 2. Query param (deprecated — migrate to Bearer header)
-  const token = req.query?.token;
-  if (typeof token === "string" && token.length >= 20) {
-    console.warn("[mcp-auth] DEPRECATED: token passed via query param. Use Authorization: Bearer header instead.");
-    return token;
-  }
 
   return null;
 }
@@ -40,31 +33,20 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
         headers: new Headers({ authorization: `Bearer ${token}` }),
       });
       if (session?.user?.id) {
-        // Look up or create wl_users entry by auth_user_id
         const sql = getSql();
-        let userId: string | null = null;
-        if (sql) {
-          try {
-            const rows = (await sql`
-              SELECT id FROM wl_users WHERE auth_user_id = ${session.user.id} LIMIT 1
-            `) as { id: string }[];
-            if (rows.length > 0) {
-              userId = rows[0].id;
-            } else {
-              // Auto-create wl_users entry for new OAuth users
-              const inserted = (await sql`
-                INSERT INTO wl_users (name, token, auth_user_id, is_active)
-                VALUES (${session.user.name || session.user.email || "oauth-user"}, ${`oauth-${session.user.id}`}, ${session.user.id}, true)
-                RETURNING id
-              `) as { id: string }[];
-              userId = inserted[0]?.id ?? null;
-            }
-          } catch (err) {
-            console.error("[mcp-auth] DB user lookup/create failed:", err);
-          }
+        if (!sql) {
+          console.error("[mcp-auth] OAuth session valid but database is not configured");
+          return { authenticated: false, userId: null, isAdmin: false, token };
         }
-        console.log("[mcp-auth]", { method: "better-auth", hasBearer, userId });
-        return { authenticated: true, userId, token };
+
+        try {
+          const user = await upsertOAuthUser(sql, session.user);
+          console.log("[mcp-auth]", { method: "better-auth", hasBearer, userId: user.id });
+          return { authenticated: true, userId: user.id, isAdmin: user.is_admin, token };
+        } catch (err) {
+          console.error("[mcp-auth] DB user lookup/create failed:", err);
+          return { authenticated: false, userId: null, isAdmin: false, token };
+        }
       }
     } catch (err) {
       console.error("[mcp-auth] Better Auth validation failed:", err);
@@ -73,7 +55,7 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
 
   if (!token) {
     console.log("[mcp-auth]", { method: "none", hasBearer: false });
-    return { authenticated: false, userId: null, token: "" };
+    return { authenticated: false, userId: null, isAdmin: false, token: "" };
   }
 
   // 2. Try per-user token from DB (legacy)
@@ -83,7 +65,7 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
       const user = await resolveUser(sql, token);
       if (user) {
         console.log("[mcp-auth]", { method: "db-token", hasBearer, userId: user.id });
-        return { authenticated: true, userId: user.id, token };
+        return { authenticated: true, userId: user.id, isAdmin: user.is_admin, token };
       }
     } catch (err) {
       console.error("[mcp-auth] DB token lookup failed:", err);
@@ -93,12 +75,23 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
   // 3. Fall back to shared token
   const sharedToken = process.env.WL_MCP_TOKEN;
   if (sharedToken && token === sharedToken) {
-    console.log("[mcp-auth]", { method: "shared-token", hasBearer });
-    return { authenticated: true, userId: null, token };
+    if (!sql) {
+      console.error("[mcp-auth] Shared token matched but database is not configured");
+      return { authenticated: false, userId: null, isAdmin: false, token };
+    }
+
+    try {
+      const user = await upsertSharedTokenUser(sql, token);
+      console.log("[mcp-auth]", { method: "shared-token", hasBearer, userId: user.id });
+      return { authenticated: true, userId: user.id, isAdmin: user.is_admin, token };
+    } catch (err) {
+      console.error("[mcp-auth] Shared token user lookup/create failed:", err);
+      return { authenticated: false, userId: null, isAdmin: false, token };
+    }
   }
 
   console.log("[mcp-auth]", { method: "rejected", hasBearer });
-  return { authenticated: false, userId: null, token };
+  return { authenticated: false, userId: null, isAdmin: false, token };
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +180,7 @@ export default async function handler(
 
       const server = createServer({
         userId: authResult.userId,
+        isAdmin: authResult.isAdmin,
         onToolCall: sql
           ? async (entry) => {
               await logCall(sql, authResult.userId, entry).catch(() => {});
@@ -209,7 +203,7 @@ export default async function handler(
           jsonrpc: "2.0",
           error: {
             code: -32603,
-            message: err instanceof Error ? err.message : "Internal error",
+            message: "Internal error",
           },
         });
       }
