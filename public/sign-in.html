@@ -97,7 +97,8 @@
       fallbackEl.style.display = "none";
 
       try {
-        const callbackURL = window.location.href;
+        const params = new URLSearchParams(window.location.search);
+        const callbackURL = params.get("callbackURL") || window.location.href;
         const resp = await fetch("/api/auth/sign-in/social", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
