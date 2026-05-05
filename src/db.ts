@@ -48,6 +48,19 @@ export interface BulkJob {
 
 let _sql: SqlClient | null = null;
 
+function getAdminEmailDecision(email?: string | null): boolean | null {
+  if (!email) return null;
+
+  const adminEmails = (process.env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (adminEmails.length === 0) return null;
+
+  return adminEmails.includes(email.toLowerCase());
+}
+
 export function getSql(): SqlClient | null {
   if (_sql) return _sql;
 
@@ -80,18 +93,22 @@ export async function upsertOAuthUser(
   sql: SqlClient,
   authUser: { id: string; name?: string | null; email?: string | null }
 ): Promise<UserIdentity> {
+  const isAdmin = getAdminEmailDecision(authUser.email);
+
   const rows = await sql`
-    INSERT INTO wl_users (name, token, auth_user_id, is_active)
+    INSERT INTO wl_users (name, token, auth_user_id, is_active, is_admin)
     VALUES (
       ${authUser.name || authUser.email || "oauth-user"},
       ${`oauth-${authUser.id}`},
       ${authUser.id},
-      true
+      true,
+      ${isAdmin ?? false}
     )
     ON CONFLICT (auth_user_id) WHERE auth_user_id IS NOT NULL
     DO UPDATE SET
       name = EXCLUDED.name,
-      is_active = true
+      is_active = true,
+      is_admin = ${isAdmin === null ? sql`wl_users.is_admin` : sql`EXCLUDED.is_admin`}
     RETURNING id, name, coalesce(is_admin, false) as is_admin
   ` as Array<{ id: string; name: string; is_admin: boolean }>;
 

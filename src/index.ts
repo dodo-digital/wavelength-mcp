@@ -72,11 +72,198 @@ const LONG_TEXT = z.string().max(20_000, "Text too long");
 const JOB_ID = z.string().min(1).max(200, "Job ID too long");
 const DOMAIN = z.string().max(253, "Domain too long");
 const URL_TEXT = z.string().max(2_048, "URL too long");
-const TAG = z.string().max(200, "Tag too long");
+const CONTEXT_DOC_TYPES = [
+  "thesis",
+  "reference",
+  "source",
+  "criteria",
+  "template",
+  "company",
+  "industry",
+  "person",
+  "learning",
+] as const;
+const CONTEXT_TAG_NAMESPACES = [
+  "company",
+  "industry",
+  "person",
+  "topic",
+  "skill",
+  "source",
+  "status",
+] as const;
 const metadataSchema = z.record(z.unknown()).refine(
   (value) => JSON.stringify(value).length <= 50_000,
   "Metadata exceeds 50KB limit"
 );
+
+function kebabPart(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
+
+function normalizeContextTag(value: string): string {
+  const [rawNamespace, ...rawValueParts] = value.split("/");
+  const namespace = kebabPart(rawNamespace ?? "");
+  const tagValue = kebabPart(rawValueParts.join("-"));
+
+  if (!namespace || !tagValue) {
+    throw new Error("Tags must use namespace/value format, e.g. industry/cybersecurity");
+  }
+
+  if (!(CONTEXT_TAG_NAMESPACES as readonly string[]).includes(namespace)) {
+    throw new Error(`Unknown tag namespace '${namespace}'. Allowed: ${CONTEXT_TAG_NAMESPACES.join(", ")}`);
+  }
+
+  return `${namespace}/${tagValue}`;
+}
+
+function uniqueTags(tags: string[]): string[] {
+  return Array.from(new Set(tags));
+}
+
+const CONTEXT_TAG = z.string().max(200, "Tag too long").transform((value, transformCtx) => {
+  try {
+    return normalizeContextTag(value);
+  } catch (err) {
+    transformCtx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: err instanceof Error ? err.message : "Invalid tag",
+    });
+    return z.NEVER;
+  }
+});
+
+function deriveContextSummary(title: string, content: string): string {
+  const line =
+    content
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .find((value) => value && !value.startsWith("#") && !value.startsWith("|")) ?? title;
+
+  return line
+    .replace(/[*_`>#\[\]()]/g, "")
+    .replace(/\s+/g, " ")
+    .slice(0, 240);
+}
+
+function withContextSummary(metadata: Record<string, unknown> | undefined, title: string, content: string): Record<string, unknown> {
+  const next = { ...(metadata ?? {}) };
+  if (typeof next.summary !== "string" || !next.summary.trim()) {
+    next.summary = deriveContextSummary(title, content);
+  }
+  return next;
+}
+
+const apolloPersonMatchSchema = z.object({
+  email: z.string().email().optional(),
+  linkedin_url: URL_TEXT.optional(),
+  first_name: SHORT_TEXT.optional(),
+  last_name: SHORT_TEXT.optional(),
+  organization_name: SHORT_TEXT.optional(),
+});
+
+const apolloBulkDetailsSchema = z.preprocess((value) => {
+  if (typeof value !== "string") return value;
+
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}, z.array(apolloPersonMatchSchema).min(1).max(10));
+
+const APOLLO_CREDIT_BALANCE_NOTE =
+  "Apollo's public API does not expose the live account credit balance. Check Apollo Settings > Billing > Credit usage or the Developer Portal Usage page for the remaining plan credits.";
+
+const APOLLO_ESTIMATED_CREDITS_NOTE =
+  "Uses Apollo's credits_consumed field when returned; otherwise estimated by Wavelength from successful enrichment matches.";
+
+const APOLLO_TRACKED_LIMITS = [
+  { key: "people_match", label: "apollo_enrich_person", endpoint: "api/v1/people", action: "match" },
+  { key: "people_bulk_match", label: "apollo_bulk_enrich_people", endpoint: "api/v1/people", action: "bulk_match" },
+  { key: "organization_enrich", label: "apollo_enrich_org", endpoint: "api/v1/organizations", action: "enrich" },
+  { key: "people_search", label: "apollo_search_people", endpoint: "api/v1/mixed_people", action: "api_search" },
+];
+
+function summarizeApolloUsageStats(stats: unknown): Record<string, unknown> {
+  if (!stats || typeof stats !== "object" || Array.isArray(stats)) {
+    return { error: "Unexpected Apollo usage stats response" };
+  }
+
+  const raw = stats as Record<string, unknown>;
+  const byEndpoint = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(raw)) {
+    try {
+      const parsed = JSON.parse(key);
+      if (Array.isArray(parsed) && parsed.length === 2) {
+        byEndpoint.set(`${parsed[0]}:${parsed[1]}`, value);
+      }
+    } catch {
+      // Apollo returns stringified tuple keys. Ignore anything else.
+    }
+  }
+
+  return {
+    note: "These are Apollo API rate limits and API-call consumption, not the account credit balance.",
+    tracked_endpoint_count: Object.keys(raw).length,
+    tracked_endpoints: Object.fromEntries(
+      APOLLO_TRACKED_LIMITS.map(({ key, label, endpoint, action }) => [
+        key,
+        {
+          tool: label,
+          endpoint,
+          action,
+          limits: byEndpoint.get(`${endpoint}:${action}`) ?? null,
+        },
+      ])
+    ),
+  };
+}
+
+function apolloCreditsConsumed(data: unknown, fallback: number): number {
+  if (data && typeof data === "object" && !Array.isArray(data)) {
+    const value = (data as Record<string, unknown>).credits_consumed;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+
+  return fallback;
+}
+
+async function getApolloStatusReport(): Promise<Record<string, unknown>> {
+  const report: Record<string, unknown> = {
+    credit_balance: {
+      available: null,
+      note: APOLLO_CREDIT_BALANCE_NOTE,
+    },
+  };
+
+  try {
+    report.health = await apollo.getAuthHealth();
+  } catch (err) {
+    report.health = {
+      error: err instanceof Error ? err.message : String(err),
+    };
+    return report;
+  }
+
+  try {
+    report.api_usage_limits = summarizeApolloUsageStats(await apollo.getUsageStats());
+  } catch (err) {
+    report.api_usage_limits = {
+      error: err instanceof Error ? err.message : String(err),
+      note: "Apollo API usage/rate-limit stats require a master API key.",
+    };
+  }
+
+  return report;
+}
 
 export function createServer(ctx?: ServerContext): McpServer {
   const server = new McpServer({
@@ -816,7 +1003,7 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- check_credits ---------------------------------------------------------
   server.tool(
     "check_credits",
-    "Check Clearout + ZeroBounce credit balances. Free.",
+    "Check Clearout + ZeroBounce credit balances and Apollo API status/rate limits. Free.",
     {},
     tracked("check_credits", { provider: null, emailCount: () => 0 },
     async () => {
@@ -840,7 +1027,10 @@ export function createServer(ctx?: ServerContext): McpServer {
         };
       }
 
-      report.note = "1 credit = 1 email verification per provider";
+      report.apollo = await getApolloStatusReport();
+
+      report.note =
+        "Clearout/ZeroBounce expose live remaining credit balances. Apollo exposes API health and API rate-limit usage, but not the live account credit balance.";
 
       return {
         content: [
@@ -1115,7 +1305,13 @@ export function createServer(ctx?: ServerContext): McpServer {
               {
                 type: "text" as const,
                 text: JSON.stringify(
-                  { found: false, query: args, message: "No match found" },
+                  {
+                    found: false,
+                    query: args,
+                    message: "No match found",
+                    _credits_used: 0,
+                    _credits_note: APOLLO_ESTIMATED_CREDITS_NOTE,
+                  },
                   null,
                   2
                 ),
@@ -1125,7 +1321,18 @@ export function createServer(ctx?: ServerContext): McpServer {
         }
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify(data.person, null, 2) },
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  ...data.person,
+                  _credits_used: apolloCreditsConsumed(data, 1),
+                  _credits_note: APOLLO_ESTIMATED_CREDITS_NOTE,
+                },
+                null,
+                2
+              ),
+            },
           ],
         };
       } catch (err) {
@@ -1147,18 +1354,9 @@ export function createServer(ctx?: ServerContext): McpServer {
     "apollo_bulk_enrich_people",
     "Apollo bulk person match (≤10 per call, 1 credit/match). >10 → call multiple times.",
     {
-      details: z
-        .array(
-          z.object({
-            email: z.string().email().optional(),
-            linkedin_url: URL_TEXT.optional(),
-            first_name: SHORT_TEXT.optional(),
-            last_name: SHORT_TEXT.optional(),
-            organization_name: SHORT_TEXT.optional(),
-          })
-        )
-        .min(1)
-        .max(10),
+      details: apolloBulkDetailsSchema.describe(
+        "Array of person match objects. Also accepts a JSON stringified array for MCP clients that serialize nested arrays."
+      ),
     },
     tracked("apollo_bulk_enrich_people", { provider: "apollo", emailCount: ({ details }: any) => details.length },
     async ({ details }) => {
@@ -1168,6 +1366,7 @@ export function createServer(ctx?: ServerContext): McpServer {
         })) as { matches: Array<Record<string, unknown> | null> };
 
         const matched = data.matches.filter((m) => m !== null).length;
+        const creditsUsed = apolloCreditsConsumed(data, matched);
 
         return {
           content: [
@@ -1178,6 +1377,8 @@ export function createServer(ctx?: ServerContext): McpServer {
                   total: details.length,
                   matched,
                   not_found: details.length - matched,
+                  _credits_used: creditsUsed,
+                  _credits_note: APOLLO_ESTIMATED_CREDITS_NOTE,
                   matches: data.matches,
                 },
                 null,
@@ -1211,9 +1412,21 @@ export function createServer(ctx?: ServerContext): McpServer {
     async ({ domain }) => {
       try {
         const data = await apollo.post("/organizations/enrich", { domain });
+        const response =
+          data && typeof data === "object" && !Array.isArray(data)
+            ? {
+                ...(data as Record<string, unknown>),
+                _credits_used: apolloCreditsConsumed(data, 1),
+                _credits_note: APOLLO_ESTIMATED_CREDITS_NOTE,
+              }
+            : {
+                data,
+                _credits_used: 1,
+                _credits_note: APOLLO_ESTIMATED_CREDITS_NOTE,
+              };
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+            { type: "text" as const, text: JSON.stringify(response, null, 2) },
           ],
         };
       } catch (err) {
@@ -1248,9 +1461,23 @@ export function createServer(ctx?: ServerContext): McpServer {
           ...args,
           page: args.page ?? 1,
         });
+        const response =
+          data && typeof data === "object" && !Array.isArray(data)
+            ? {
+                ...(data as Record<string, unknown>),
+                _credits_used: 0,
+                _credits_note:
+                  "Apollo documents People API Search as optimized for API usage and not consuming credits.",
+              }
+            : {
+                data,
+                _credits_used: 0,
+                _credits_note:
+                  "Apollo documents People API Search as optimized for API usage and not consuming credits.",
+              };
         return {
           content: [
-            { type: "text" as const, text: JSON.stringify(data, null, 2) },
+            { type: "text" as const, text: JSON.stringify(response, null, 2) },
           ],
         };
       } catch (err) {
@@ -1418,15 +1645,16 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- query_context ----------------------------------------------------------
   server.tool(
     "query_context",
-    "Search shared context docs. By slug (full doc), doc_type, tags, keyword (full-text), or no params (summary index). Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces. include_history with slug for edit log.",
+    "Search shared context docs. By slug (full doc), doc_type, normalized tags, keyword (full-text), or no params (summary index). Doc types: thesis, reference, source, criteria, template, company, industry, person, learning. Tags: company/, industry/, person/, topic/, skill/, source/, status/. tag_match='any' for broad recall or 'all' for exact intersections. include_history with slug for edit log.",
     {
       slug: z.string().max(128, "Slug too long").optional().describe("Exact slug for full doc (e.g. 'thesis')"),
-      doc_type: z.enum(["thesis", "reference", "source", "criteria", "template"]).optional(),
-      tags: z.array(TAG).max(50).optional().describe("Namespaced tags (matches ANY)"),
+      doc_type: z.enum(CONTEXT_DOC_TYPES).optional(),
+      tags: z.array(CONTEXT_TAG).max(50).optional().describe("Namespaced tags, normalized to kebab-case"),
+      tag_match: z.enum(["any", "all"]).optional().describe("Default 'any'. Use 'all' when every provided tag must match."),
       keyword: z.string().max(500, "Keyword too long").optional(),
       include_history: z.boolean().optional().describe("Edit log (slug lookup only)"),
     },
-    async ({ slug, doc_type, tags, keyword, include_history }) => {
+    async ({ slug, doc_type, tags, tag_match, keyword, include_history }) => {
       const denied = requireAuth("query_context");
       if (denied) return denied;
 
@@ -1443,9 +1671,11 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       const start = Date.now();
+      const tagArray = uniqueTags(tags ?? []);
+      const tagMatch = tag_match ?? "any";
       let result: { content: Array<{ type: "text"; text: string }>; isError?: boolean };
       let logDetails: Record<string, unknown> = {
-        query: { slug, doc_type, tags, keyword, include_history },
+        query: { slug, doc_type, tags: tagArray, tag_match: tagMatch, keyword, include_history },
       };
 
       try {
@@ -1476,14 +1706,15 @@ export function createServer(ctx?: ServerContext): McpServer {
 
           logDetails.result_count = rows.length;
           logDetails.slugs = rows.map((r) => r.slug);
-        } else if (keyword?.trim() || (tags && tags.length > 0) || doc_type) {
+        } else if (keyword?.trim() || tagArray.length > 0 || doc_type) {
           // Path 2: Composable search (keyword + tags + doc_type — any combination)
           const rows = (await sql`
             SELECT id, slug, doc_type, title, tags, metadata, version, updated_by, created_at, updated_at
             FROM wl_context
             WHERE true
               ${keyword?.trim() ? sql`AND to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '')) @@ plainto_tsquery('english', ${keyword.trim()})` : sql``}
-              ${tags && tags.length > 0 ? sql`AND tags && ${tags}` : sql``}
+              ${tagArray.length > 0 && tagMatch === "all" ? sql`AND tags @> ${tagArray}` : sql``}
+              ${tagArray.length > 0 && tagMatch === "any" ? sql`AND tags && ${tagArray}` : sql``}
               ${doc_type ? sql`AND doc_type = ${doc_type}` : sql``}
             ORDER BY updated_at DESC
             LIMIT 20
@@ -1532,23 +1763,118 @@ export function createServer(ctx?: ServerContext): McpServer {
     }
   );
 
+  // -- list_context_tags ------------------------------------------------------
+  server.tool(
+    "list_context_tags",
+    "List normalized tags currently used in shared memory, grouped by namespace with document counts. Use before creating new memory docs when you need the existing tag vocabulary.",
+    {
+      namespace: z.enum(CONTEXT_TAG_NAMESPACES).optional().describe("Optional tag namespace filter"),
+      limit: z.number().int().min(1).max(1000).optional().describe("Max tags to return; default 500"),
+    },
+    async ({ namespace, limit }) => {
+      const denied = requireAuth("list_context_tags");
+      if (denied) return denied;
+
+      const sql = getSql();
+      if (!sql) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({ count: 0, tags: [], namespaces: {}, note: "Database not configured" }, null, 2),
+            },
+          ],
+        };
+      }
+
+      const start = Date.now();
+      let result: { content: Array<{ type: "text"; text: string }>; isError?: boolean };
+      let logDetails: Record<string, unknown> = { namespace, limit: limit ?? 500 };
+
+      try {
+        const rows = (await sql`
+          SELECT
+            split_part(tag, '/', 1) AS namespace,
+            tag,
+            split_part(tag, '/', 2) AS value,
+            count(*)::int AS document_count
+          FROM wl_context, unnest(tags) AS tag
+          WHERE ${namespace ? sql`split_part(tag, '/', 1) = ${namespace}` : sql`true`}
+          GROUP BY tag
+          ORDER BY namespace ASC, document_count DESC, tag ASC
+          LIMIT ${limit ?? 500}
+        `) as Array<{ namespace: string; tag: string; value: string; document_count: number }>;
+
+        const namespaces: Record<string, Array<{ tag: string; value: string; document_count: number }>> = {};
+        for (const row of rows) {
+          namespaces[row.namespace] ??= [];
+          namespaces[row.namespace].push({
+            tag: row.tag,
+            value: row.value,
+            document_count: row.document_count,
+          });
+        }
+
+        logDetails.result_count = rows.length;
+        result = {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  count: rows.length,
+                  namespaces,
+                  tags: rows,
+                  allowed_namespaces: CONTEXT_TAG_NAMESPACES,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        console.error("[list_context_tags]", err);
+        result = {
+          content: [{ type: "text" as const, text: JSON.stringify({ error: "Tag listing failed" }, null, 2) }],
+          isError: true,
+        };
+      }
+
+      if (ctx?.onToolCall) {
+        ctx.onToolCall({
+          tool: "list_context_tags",
+          provider: undefined,
+          email_count: 0,
+          credits_used: 0,
+          status: result.isError ? "error" : "success",
+          error_message: result.isError ? result.content[0]?.text?.slice(0, 500) : undefined,
+          duration_ms: Date.now() - start,
+          details: logDetails,
+        }).catch(() => {});
+      }
+
+      return result;
+    }
+  );
+
   // -- update_context ---------------------------------------------------------
   server.tool(
     "update_context",
-    "Upsert context doc by slug. Snapshots previous version to history. Tracks editor, version, timestamp. Omitting doc_type/tags/metadata on update preserves existing values. Tags: industry/, skill/, source/, status/, topic/, company/, person/ namespaces.",
+    "Upsert context doc by slug. Snapshots previous version to history. Tracks editor, version, timestamp. Omitting doc_type/tags/metadata on update preserves existing values. Doc types: thesis, reference, source, criteria, template, company, industry, person, learning. Tags are normalized to kebab-case and must use company/, industry/, person/, topic/, skill/, source/, or status/. metadata.summary is auto-filled when omitted.",
     {
       slug: SLUG_SCHEMA,
       title: SHORT_TEXT,
       content: z.string().min(1).max(100000, "Content exceeds 100KB limit").describe("Markdown"),
       doc_type: z
-        .enum(["thesis", "reference", "source", "criteria", "template"])
+        .enum(CONTEXT_DOC_TYPES)
         .optional()
         .describe("Defaults to 'reference' for new docs. Omit to preserve."),
       tags: z
-        .array(TAG)
+        .array(CONTEXT_TAG)
         .max(50, "Too many tags")
         .optional()
-        .describe("Omit to preserve existing"),
+        .describe("Omit to preserve existing. Values are normalized to kebab-case."),
       metadata: metadataSchema.optional().describe("Omit to preserve existing"),
     },
     async ({ slug, title, content, doc_type, tags, metadata }) => {
@@ -1569,9 +1895,11 @@ export function createServer(ctx?: ServerContext): McpServer {
       }
 
       const editor = ctx?.userId ?? "claude";
-      const tagArray = tags ?? [];
+      const tagArray = uniqueTags(tags ?? []);
       const tagsProvided = tags !== undefined;
-      const meta = metadata ? JSON.stringify(metadata) : null;
+      const metadataWithSummary = metadata ? withContextSummary(metadata, title, content) : undefined;
+      const meta = metadataWithSummary ? JSON.stringify(metadataWithSummary) : null;
+      const defaultSummary = deriveContextSummary(title, content);
       const docType = doc_type ?? null;
 
       const start = Date.now();
@@ -1590,7 +1918,7 @@ export function createServer(ctx?: ServerContext): McpServer {
               ${title},
               ${content},
               ${tagArray},
-              COALESCE(${meta}, '{}')::jsonb,
+              COALESCE(${meta}::jsonb, jsonb_build_object('summary', ${defaultSummary}::text)),
               ${editor},
               1
             )
@@ -1599,7 +1927,12 @@ export function createServer(ctx?: ServerContext): McpServer {
               title = EXCLUDED.title,
               content = EXCLUDED.content,
               tags = ${tagsProvided ? sql`EXCLUDED.tags` : sql`wl_context.tags`},
-              metadata = ${meta !== null ? sql`EXCLUDED.metadata` : sql`wl_context.metadata`},
+              metadata = CASE
+                WHEN ${meta !== null} THEN EXCLUDED.metadata
+                WHEN COALESCE(wl_context.metadata->>'summary', '') = '' THEN
+                  COALESCE(wl_context.metadata, '{}'::jsonb) || jsonb_build_object('summary', ${defaultSummary}::text)
+                ELSE wl_context.metadata
+              END,
               updated_by = EXCLUDED.updated_by,
               version = wl_context.version + 1,
               updated_at = now()
@@ -1689,7 +2022,7 @@ export function createServer(ctx?: ServerContext): McpServer {
   // -- admin_report -----------------------------------------------------------
   server.tool(
     "admin_report",
-    "Usage report: calls, credits, errors by tool/provider + live credit balances.",
+    "Usage report: calls, credits, errors by tool/provider + live provider balances/status.",
     {
       days: z.number().min(1).max(90).optional().describe("Lookback days (default 7)"),
     },
@@ -1713,6 +2046,11 @@ export function createServer(ctx?: ServerContext): McpServer {
         credits.zerobounce = { available: zb };
       } catch (err) {
         credits.zerobounce = { error: err instanceof Error ? err.message : String(err) };
+      }
+      try {
+        credits.apollo = await getApolloStatusReport();
+      } catch (err) {
+        credits.apollo = { error: err instanceof Error ? err.message : String(err) };
       }
       report.live_credits = credits;
 

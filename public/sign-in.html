@@ -87,6 +87,35 @@
   </div>
 
   <script>
+    function parseSignedQuery(search) {
+      const params = new URLSearchParams(search);
+      if (!params.has("sig")) return undefined;
+
+      const signedParams = new URLSearchParams();
+      for (const [key, value] of params.entries()) {
+        signedParams.append(key, value);
+        if (key === "sig") break;
+      }
+
+      return signedParams.toString();
+    }
+
+    function getCallbackURL() {
+      const params = new URLSearchParams(window.location.search);
+      const explicitCallbackURL = params.get("callbackURL");
+      if (explicitCallbackURL) return explicitCallbackURL;
+
+      if (
+        params.has("client_id") &&
+        params.has("redirect_uri") &&
+        params.get("response_type") === "code"
+      ) {
+        return `${window.location.origin}/api/auth/oauth2/authorize${window.location.search}`;
+      }
+
+      return window.location.href;
+    }
+
     async function signIn() {
       const btn = document.getElementById("msBtn");
       const errorEl = document.getElementById("error");
@@ -97,12 +126,16 @@
       fallbackEl.style.display = "none";
 
       try {
-        const params = new URLSearchParams(window.location.search);
-        const callbackURL = params.get("callbackURL") || window.location.href;
+        const callbackURL = getCallbackURL();
+        const oauthQuery = parseSignedQuery(window.location.search);
         const resp = await fetch("/api/auth/sign-in/social", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider: "microsoft", callbackURL }),
+          body: JSON.stringify({
+            provider: "microsoft",
+            callbackURL,
+            oauth_query: oauthQuery,
+          }),
         });
 
         if (!resp.ok) {

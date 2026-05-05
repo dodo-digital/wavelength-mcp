@@ -15,7 +15,7 @@ Deployed on Vercel. Postgres on Neon.
 | `bulk_validate` | Either | Async batch validation (>20 emails), returns job_id |
 | `bulk_status` | Either | Check bulk job progress |
 | `bulk_results` | Either | Download completed bulk results |
-| `check_credits` | Both | Check credit balances across providers |
+| `check_credits` | Clearout, ZeroBounce, Apollo | Check live Clearout/ZeroBounce balances plus Apollo API health and rate limits |
 
 ### Outreach (Reply.io)
 
@@ -35,12 +35,15 @@ Deployed on Vercel. Postgres on Neon.
 | `apollo_enrich_org` | Company enrichment by domain |
 | `apollo_search_people` | Search people database by domain, title, seniority |
 
+Apollo does not expose the live account credit balance through its public API. `check_credits` reports Apollo API health and rate-limit usage only; use Apollo's Billing > Credit usage page or Developer Portal Usage page for remaining plan credits.
+
 ### Shared Context
 
 | Tool | Description |
 |------|-------------|
-| `query_context` | Search context docs by slug, tags, keyword, or doc_type |
-| `update_context` | Upsert context docs with version history and tag taxonomy |
+| `query_context` | Search context docs by slug, tags, keyword, or doc_type; supports `tag_match` any/all |
+| `list_context_tags` | List existing memory tags grouped by namespace with document counts |
+| `update_context` | Upsert context docs with version history, normalized tags, and `metadata.summary` |
 
 ### Skill Learnings
 
@@ -53,7 +56,7 @@ Deployed on Vercel. Postgres on Neon.
 
 | Tool | Description |
 |------|-------------|
-| `admin_report` | Usage report with call stats and live credit balances |
+| `admin_report` | Usage report with call stats plus live provider balances/status |
 
 ## Setup
 

@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const RESOURCE_URL = "https://wavelength-mcp.vercel.app";
+const RESOURCE_URL = "https://wavelength-mcp.vercel.app/mcp";
+const AUTHORIZATION_SERVER_URL = "https://wavelength-mcp.vercel.app";
 
 export default function handler(_req: VercelRequest, res: VercelResponse) {
   console.log("[oauth-meta] protected resource metadata requested");
@@ -19,8 +20,8 @@ export default function handler(_req: VercelRequest, res: VercelResponse) {
 
   return res.status(200).json({
     resource: RESOURCE_URL,
-    authorization_servers: [RESOURCE_URL],
+    authorization_servers: [AUTHORIZATION_SERVER_URL],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["openid", "profile", "email"],
+    scopes_supported: ["openid", "profile", "email", "offline_access"],
   });
 }

@@ -1,11 +1,3 @@
 {
-  "mcpServers": {
-    "wavelength": {
-      "type": "http",
-      "url": "https://wavelength-mcp.vercel.app/mcp",
-      "headers": {
-        "Authorization": "Bearer ${WL_MCP_TOKEN}"
-      }
-    }
-  }
+  "mcpServers": {}
 }

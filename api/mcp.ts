@@ -1,8 +1,9 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { verifyAccessToken } from "better-auth/oauth2";
 import { createServer } from "../src/index.js";
 import { getSql, resolveUser, logCall, upsertOAuthUser, upsertSharedTokenUser } from "../src/db.js";
-import { auth } from "../src/auth.js";
+import { auth, authIssuerURLs, authJwksURL, mcpResourceURL } from "../src/auth.js";
 
 // ---------------------------------------------------------------------------
 // Auth — Better Auth OAuth → per-user DB token → shared token fallback
@@ -26,7 +27,51 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
   const token = extractToken(req);
   const hasBearer = !!token;
 
-  // 1. Try Better Auth session/token validation
+  // 1. Try Better Auth OAuth provider access-token validation
+  if (token) {
+    try {
+      const payload = await verifyAccessToken(token, {
+        jwksUrl: authJwksURL,
+        verifyOptions: {
+          issuer: authIssuerURLs,
+        } as any,
+      });
+
+      if (typeof payload.sub === "string") {
+        const audience = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+        if (audience.length > 0 && !audience.includes(mcpResourceURL)) {
+          console.error("[mcp-auth] OAuth token audience mismatch:", {
+            audience,
+            expected: mcpResourceURL,
+          });
+          return { authenticated: false, userId: null, isAdmin: false, token };
+        }
+
+        const sql = getSql();
+        if (!sql) {
+          console.error("[mcp-auth] OAuth token valid but database is not configured");
+          return { authenticated: false, userId: null, isAdmin: false, token };
+        }
+
+        try {
+          const user = await upsertOAuthUser(sql, {
+            id: payload.sub,
+            name: typeof payload.name === "string" ? payload.name : null,
+            email: typeof payload.email === "string" ? payload.email : null,
+          });
+          console.log("[mcp-auth]", { method: "oauth-access-token", hasBearer, userId: user.id });
+          return { authenticated: true, userId: user.id, isAdmin: user.is_admin, token };
+        } catch (err) {
+          console.error("[mcp-auth] OAuth token DB user lookup/create failed:", err);
+          return { authenticated: false, userId: null, isAdmin: false, token };
+        }
+      }
+    } catch (err) {
+      console.error("[mcp-auth] OAuth access-token validation failed:", err);
+    }
+  }
+
+  // 2. Try Better Auth session/token validation
   if (token) {
     try {
       const session = await auth.api.getSession({
@@ -58,7 +103,7 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
     return { authenticated: false, userId: null, isAdmin: false, token: "" };
   }
 
-  // 2. Try per-user token from DB (legacy)
+  // 3. Try per-user token from DB (legacy)
   const sql = getSql();
   if (sql) {
     try {
@@ -72,7 +117,7 @@ async function authenticate(req: VercelRequest): Promise<AuthResult> {
     }
   }
 
-  // 3. Fall back to shared token
+  // 4. Fall back to shared token
   const sharedToken = process.env.WL_MCP_TOKEN;
   if (sharedToken && token === sharedToken) {
     if (!sql) {

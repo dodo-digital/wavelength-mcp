@@ -120,12 +120,21 @@
   <script>
     // Parse OAuth params from URL
     const params = new URLSearchParams(window.location.search);
-    const clientId = params.get("client_id");
-    const redirectUri = params.get("redirect_uri");
-    const state = params.get("state");
     const scope = params.get("scope");
-    const codeChallenge = params.get("code_challenge");
-    const codeChallengeMethod = params.get("code_challenge_method");
+    const oauthQuery = parseSignedQuery(window.location.search);
+
+    function parseSignedQuery(search) {
+      const params = new URLSearchParams(search);
+      if (!params.has("sig")) return undefined;
+
+      const signedParams = new URLSearchParams();
+      for (const [key, value] of params.entries()) {
+        signedParams.append(key, value);
+        if (key === "sig") break;
+      }
+
+      return signedParams.toString();
+    }
 
     async function approve() {
       const btn = document.getElementById("approveBtn");
@@ -142,12 +151,8 @@
           credentials: "include",
           body: JSON.stringify({
             accept: true,
-            clientId,
-            scope: scope || "mcp",
-            redirectUri,
-            state,
-            codeChallenge,
-            codeChallengeMethod,
+            scope: scope || undefined,
+            oauth_query: oauthQuery,
           }),
         });
 
@@ -158,9 +163,9 @@
 
         const data = await resp.json();
 
-        if (data.redirectTo || data.url) {
+        if (data.redirect_uri || data.redirectURI || data.redirectTo || data.url) {
           // Try redirect
-          const target = data.redirectTo || data.url;
+          const target = data.redirect_uri || data.redirectURI || data.redirectTo || data.url;
           window.location.href = target;
 
           // After short delay, show code as fallback
@@ -195,15 +200,13 @@
           credentials: "include",
           body: JSON.stringify({
             accept: false,
-            clientId,
-            redirectUri,
-            state,
+            oauth_query: oauthQuery,
           }),
         });
         if (resp.ok) {
           const data = await resp.json();
-          if (data.redirectTo || data.url) {
-            window.location.href = data.redirectTo || data.url;
+          if (data.redirect_uri || data.redirectURI || data.redirectTo || data.url) {
+            window.location.href = data.redirect_uri || data.redirectURI || data.redirectTo || data.url;
             return;
           }
         }
