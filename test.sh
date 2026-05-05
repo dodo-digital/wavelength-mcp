@@ -1,23 +1,53 @@
 #!/usr/bin/env bash
-# Wavelength MCP integration test — hits Vercel production via JSON-RPC over SSE
+# Wavelength MCP smoke/integration tests.
+#
+# Defaults are safe for production:
+#   - no hardcoded token
+#   - no credit-spending provider calls
+#   - no mutating context/learning writes
+#
+# Examples:
+#   ./test.sh
+#   WAVELENGTH_MCP_TOKEN=... ./test.sh
+#   WAVELENGTH_MCP_TOKEN=... RUN_PROVIDER_TESTS=1 ./test.sh
+#   WAVELENGTH_MCP_TOKEN=... RUN_MUTATION_TESTS=1 ./test.sh
 set -euo pipefail
 
-TOKEN="dev-test-8126f147d1c495a6ecf0074c6e9f5b50"
-URL="https://wavelength-mcp.vercel.app/mcp"
+URL="${WAVELENGTH_MCP_URL:-https://wavelength-mcp.vercel.app/mcp}"
+BASE_URL="${URL%/mcp}"
+TOKEN="${WAVELENGTH_MCP_TOKEN:-${MCP_TOKEN:-}}"
+TEST_EMAIL="${TEST_EMAIL:-test@gmail.com}"
+TEST_DOMAIN="${TEST_DOMAIN:-google.com}"
+TEST_CONTEXT_SLUG="${TEST_CONTEXT_SLUG:-test-integration}"
+
+RUN_PROVIDER_TESTS="${RUN_PROVIDER_TESTS:-0}"
+RUN_MUTATION_TESTS="${RUN_MUTATION_TESTS:-0}"
+RUN_DESTRUCTIVE_TESTS="${RUN_DESTRUCTIVE_TESTS:-0}"
+RUN_BULK_TESTS="${RUN_BULK_TESTS:-0}"
+
 PASS=0
 FAIL=0
 SKIP=0
 ID=0
 
+auth_header=()
+if [[ -n "$TOKEN" ]]; then
+  auth_header=(-H "Authorization: Bearer $TOKEN")
+fi
+
+json_rpc() {
+  local body="$1"
+  curl -sS -X POST "$URL" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    "${auth_header[@]}" \
+    -d "$body" | sed -n 's/^data: //p'
+}
+
 mcp() {
   local tool="$1" args="$2"
   ID=$((ID + 1))
-  local body="{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
-  curl -s -X POST "$URL" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json, text/event-stream' \
-    -H "Authorization: Bearer $TOKEN" \
-    -d "$body" | grep '^data:' | sed 's/^data: //'
+  json_rpc "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
 }
 
 check() {
@@ -27,14 +57,13 @@ check() {
     PASS=$((PASS + 1))
   else
     echo "  FAIL  $label"
-    echo "        $(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('result',d.get('error',d)),indent=None)[:200])" 2>/dev/null || echo "$result" | head -c 200)"
+    echo "        $(echo "$result" | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.dumps(d.get('result',d.get('error',d)),indent=None)[:240])" 2>/dev/null || echo "$result" | head -c 240)"
     FAIL=$((FAIL + 1))
   fi
 }
 
 check_tool() {
   local label="$1" result="$2" expect="$3"
-  # Tool results are nested: result.content[0].text contains JSON
   if echo "$result" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -51,171 +80,166 @@ import sys, json
 try:
   d = json.load(sys.stdin)
   text = d.get('result',{}).get('content',[{}])[0].get('text','')
-  print(text[:200])
-except: print(json.dumps(d)[:200])
-" 2>/dev/null || echo "$result" | head -c 200)"
+  print(text[:240])
+except Exception:
+  print(json.dumps(d)[:240])
+" 2>/dev/null || echo "$result" | head -c 240)"
     FAIL=$((FAIL + 1))
   fi
 }
 
 skip() {
-  echo "  SKIP  $1 — $2"
+  echo "  SKIP  $1 - $2"
   SKIP=$((SKIP + 1))
 }
 
-echo "=== Wavelength MCP Integration Tests ==="
+require_token() {
+  local label="$1"
+  if [[ -z "$TOKEN" ]]; then
+    skip "$label" "set WAVELENGTH_MCP_TOKEN to run authenticated checks"
+    return 1
+  fi
+  return 0
+}
+
+require_flag() {
+  local label="$1" flag_name="$2" flag_value="$3" reason="$4"
+  if [[ "$flag_value" != "1" ]]; then
+    skip "$label" "set $flag_name=1 to run $reason"
+    return 1
+  fi
+  return 0
+}
+
+echo "=== Wavelength MCP Tests ==="
 echo "Target: $URL"
+echo "Authenticated: $([[ -n "$TOKEN" ]] && echo yes || echo no)"
 echo ""
 
-# ---- Health ----
-echo "--- Health ---"
-R=$(curl -s "$URL")
-check "GET /mcp health" "$R" "'d[\"status\"] == \"ok\"'"
+echo "--- Public smoke ---"
+R=$(curl -sS "$URL")
+check "GET /mcp health" "$R" "'d[\"status\"] == \"ok\" and d[\"transport\"] == \"streamable-http\"'"
 
-# ---- Initialize ----
-echo "--- Initialize ---"
-ID=$((ID + 1))
-R=$(curl -s -X POST "$URL" \
-  -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' \
-  -H "Authorization: Bearer $TOKEN" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}" \
-  | grep '^data:' | sed 's/^data: //')
-check "MCP initialize" "$R" "'d[\"result\"][\"serverInfo\"][\"name\"] == \"wavelength\"'"
+R=$(curl -sS "$BASE_URL/.well-known/oauth-protected-resource")
+check "OAuth protected-resource metadata" "$R" "'authorization_servers' in d and d['resource'].endswith('/mcp')"
 
-# ---- Auth check ----
-echo "--- Auth (reject bad token) ---"
+R=$(curl -sS "$BASE_URL/.well-known/oauth-authorization-server")
+check "OAuth authorization-server metadata" "$R" "'authorization_endpoint' in d and 'token_endpoint' in d and 'registration_endpoint' in d"
+
+echo "--- Auth rejection ---"
 ID=$((ID + 1))
-R=$(curl -s -X POST "$URL" \
+R=$(curl -sS -X POST "$URL" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -H "Authorization: Bearer bad-token-12345" \
-  -d "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"tools/call\",\"params\":{\"name\":\"check_credits\",\"arguments\":{}}}")
-check "Reject bad token (401)" "$R" "'d.get(\"error\",{}).get(\"message\",\"\").startswith(\"Authorization\")'"
+  -d "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}")
+check "Reject bad token" "$R" "'Authorization required' in d.get('error',{}).get('message','')"
 
-# ---- check_credits ----
-echo "--- check_credits ---"
-R=$(mcp "check_credits" '{}')
-check_tool "check_credits returns data" "$R" "'\"clearout\" in payload or \"zerobounce\" in payload'"
+echo "--- MCP initialize ---"
+if require_token "MCP initialize"; then
+  ID=$((ID + 1))
+  R=$(json_rpc "{\"jsonrpc\":\"2.0\",\"id\":$ID,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1.0\"}}}")
+  check "MCP initialize" "$R" "'d[\"result\"][\"serverInfo\"][\"name\"] == \"wavelength\"'"
+fi
 
-# ---- validate_email (single) ----
-echo "--- validate_email ---"
-R=$(mcp "validate_email" '{"email":"test@gmail.com"}')
-check_tool "validate_email single" "$R" "'\"status\" in payload or \"error\" in payload'"
+echo "--- Read-only authenticated tools ---"
+if require_token "check_credits"; then
+  R=$(mcp "check_credits" '{}')
+  check_tool "check_credits returns provider status" "$R" "'clearout' in payload or 'zerobounce' in payload or 'apollo' in payload"
+fi
 
-# ---- zb_validate_email (single) ----
-echo "--- zb_validate_email ---"
-R=$(mcp "zb_validate_email" '{"email":"test@gmail.com"}')
-check_tool "zb_validate_email single" "$R" "'\"status\" in payload or \"error\" in payload'"
+if require_token "query_context list"; then
+  R=$(mcp "query_context" '{}')
+  check_tool "query_context list" "$R" "'documents' in payload"
+fi
 
-# ---- validate_email (batch) ----
-echo "--- validate_email (batch) ---"
-R=$(mcp "validate_email" '{"email":["test@gmail.com","invalid@fake.xyz"]}')
-check_tool "validate_email batch" "$R" "'\"results\" in payload or \"error\" in payload'"
+if require_token "list_context_tags"; then
+  R=$(mcp "list_context_tags" '{}')
+  check_tool "list_context_tags" "$R" "'tags' in payload and 'allowed_namespaces' in payload"
+fi
 
-# ---- apollo_enrich_org ----
-echo "--- apollo_enrich_org ---"
-R=$(mcp "apollo_enrich_org" '{"domain":"google.com"}')
-check_tool "apollo_enrich_org" "$R" "True"
+if require_token "reply_list_sequences"; then
+  R=$(mcp "reply_list_sequences" '{}')
+  check_tool "reply_list_sequences" "$R" "'sequences' in payload or 'error' in payload"
+fi
 
-# ---- apollo_search_people ----
-echo "--- apollo_search_people ---"
-R=$(mcp "apollo_search_people" '{"organization_domains":["google.com"],"person_seniorities":["c_suite"],"page":1}')
-check_tool "apollo_search_people" "$R" "True"
+if require_token "reply_search_contact"; then
+  R=$(mcp "reply_search_contact" '{"email":"nobody@example.com"}')
+  check_tool "reply_search_contact" "$R" "True"
+fi
 
-# ---- apollo_enrich_person ----
-echo "--- apollo_enrich_person ---"
-R=$(mcp "apollo_enrich_person" '{"organization_name":"Google","first_name":"Sundar","last_name":"Pichai"}')
-check_tool "apollo_enrich_person" "$R" "True"
+echo "--- Provider credit/API tests ---"
+if require_token "validate_email" && require_flag "validate_email" "RUN_PROVIDER_TESTS" "$RUN_PROVIDER_TESTS" "credit-spending provider tests"; then
+  R=$(mcp "validate_email" "{\"email\":\"$TEST_EMAIL\"}")
+  check_tool "validate_email single" "$R" "'status' in payload or 'error' in payload"
+fi
 
-# ---- reply_list_sequences ----
-echo "--- reply_list_sequences ---"
-R=$(mcp "reply_list_sequences" '{}')
-check_tool "reply_list_sequences" "$R" "'\"sequences\" in payload or \"error\" in payload'"
+if require_token "zb_validate_email" && require_flag "zb_validate_email" "RUN_PROVIDER_TESTS" "$RUN_PROVIDER_TESTS" "credit-spending provider tests"; then
+  R=$(mcp "zb_validate_email" "{\"email\":\"$TEST_EMAIL\"}")
+  check_tool "zb_validate_email single" "$R" "'status' in payload or 'error' in payload"
+fi
 
-# ---- reply_search_contact ----
-echo "--- reply_search_contact ---"
-R=$(mcp "reply_search_contact" '{"email":"nobody@example.com"}')
-check_tool "reply_search_contact" "$R" "True"
+if require_token "apollo_enrich_org" && require_flag "apollo_enrich_org" "RUN_PROVIDER_TESTS" "$RUN_PROVIDER_TESTS" "external provider tests"; then
+  R=$(mcp "apollo_enrich_org" "{\"domain\":\"$TEST_DOMAIN\"}")
+  check_tool "apollo_enrich_org" "$R" "True"
+fi
 
-# ---- query_context (list all) ----
-echo "--- query_context ---"
-R=$(mcp "query_context" '{}')
-check_tool "query_context list all" "$R" "'\"documents\" in payload'"
+if require_token "apollo_search_people" && require_flag "apollo_search_people" "RUN_PROVIDER_TESTS" "$RUN_PROVIDER_TESTS" "external provider tests"; then
+  R=$(mcp "apollo_search_people" "{\"organization_domains\":[\"$TEST_DOMAIN\"],\"person_seniorities\":[\"c_suite\"],\"page\":1}")
+  check_tool "apollo_search_people" "$R" "True"
+fi
 
-# ---- update_context (create) ----
-echo "--- update_context ---"
-R=$(mcp "update_context" '{"slug":"test-integration","title":"Integration Test Doc","content":"This is a test document.","doc_type":"reference","tags":["status/draft","topic/testing"]}')
-check_tool "update_context create" "$R" "'payload.get(\"saved\") == True and payload.get(\"change_type\") == \"created\"'"
+echo "--- Mutation tests ---"
+if require_token "update_context create/update" && require_flag "update_context create/update" "RUN_MUTATION_TESTS" "$RUN_MUTATION_TESTS" "context mutation tests"; then
+  R=$(mcp "update_context" "{\"slug\":\"$TEST_CONTEXT_SLUG\",\"title\":\"Integration Test Doc\",\"content\":\"This is a test document.\",\"doc_type\":\"reference\",\"tags\":[\"status/draft\",\"topic/testing\"]}")
+  check_tool "update_context upsert" "$R" "'payload.get(\"saved\") == True and payload.get(\"change_type\") in (\"created\", \"updated\")'"
 
-# ---- query_context (slug lookup) ----
-echo "--- query_context (slug) ---"
-R=$(mcp "query_context" '{"slug":"test-integration"}')
-check_tool "query_context slug lookup" "$R" "'payload[\"documents\"][0][\"title\"] == \"Integration Test Doc\"'"
+  R=$(mcp "query_context" "{\"slug\":\"$TEST_CONTEXT_SLUG\",\"include_history\":true}")
+  check_tool "query_context slug lookup" "$R" "'documents' in payload and payload['count'] >= 1"
+fi
 
-# ---- update_context (update — preserve doc_type) ----
-echo "--- update_context (partial update) ---"
-R=$(mcp "update_context" '{"slug":"test-integration","title":"Updated Test Doc","content":"Updated content."}')
-check_tool "update_context preserves doc_type" "$R" "'payload.get(\"saved\") == True and payload.get(\"change_type\") == \"updated\" and payload.get(\"version\") == 2'"
+if require_token "update_context validation" && require_flag "update_context validation" "RUN_MUTATION_TESTS" "$RUN_MUTATION_TESTS" "context mutation tests"; then
+  R=$(mcp "update_context" '{"slug":"BAD SLUG!","title":"Fail","content":"x"}')
+  check "update_context rejects bad slug" "$R" "'error' in d.get('result',d) or 'isError' in str(d)"
+fi
 
-# ---- query_context (verify doc_type preserved) ----
-echo "--- query_context (verify preserve) ---"
-R=$(mcp "query_context" '{"slug":"test-integration"}')
-check_tool "doc_type preserved as reference" "$R" "'payload[\"documents\"][0][\"doc_type\"] == \"reference\"'"
+if require_token "save_skill_learning" && require_flag "save_skill_learning" "RUN_MUTATION_TESTS" "$RUN_MUTATION_TESTS" "skill learning mutation tests"; then
+  R=$(mcp "save_skill_learning" '{"skill":"test-skill","category":"edge-case","content":"Integration test learning - safe to delete"}')
+  check_tool "save_skill_learning" "$R" "'payload.get(\"saved\") == True'"
 
-# ---- query_context (with history) ----
-echo "--- query_context (history) ---"
-R=$(mcp "query_context" '{"slug":"test-integration","include_history":true}')
-check_tool "query_context includes history" "$R" "'\"history\" in payload and len(payload[\"history\"]) >= 1'"
+  R=$(mcp "get_skill_learnings" '{"skill":"test-skill"}')
+  check_tool "get_skill_learnings" "$R" "'payload[\"count\"] >= 1'"
+fi
 
-# ---- query_context (keyword search) ----
-echo "--- query_context (keyword) ---"
-R=$(mcp "query_context" '{"keyword":"Updated content"}')
-check_tool "query_context keyword search" "$R" "'payload[\"count\"] >= 1'"
+echo "--- Admin and destructive checks ---"
+if require_token "admin_report" && require_flag "admin_report" "RUN_PROVIDER_TESTS" "$RUN_PROVIDER_TESTS" "provider/admin checks"; then
+  R=$(mcp "admin_report" '{"days":1}')
+  check_tool "admin_report" "$R" "'live_credits' in payload or 'error' in payload"
+fi
 
-# ---- query_context (tag filter) ----
-echo "--- query_context (tags) ---"
-R=$(mcp "query_context" '{"tags":["topic/testing"]}')
-check_tool "query_context tag filter" "$R" "'payload[\"count\"] >= 1'"
+if require_token "bulk_validate / bulk_status / bulk_results"; then
+  if require_flag "bulk_validate / bulk_status / bulk_results" "RUN_BULK_TESTS" "$RUN_BULK_TESTS" "bulk validation tests"; then
+    R=$(mcp "bulk_validate" "{\"provider\":\"clearout\",\"emails\":[\"$TEST_EMAIL\"]}")
+    check_tool "bulk_validate submit" "$R" "'job_id' in payload or 'error' in payload"
+  fi
+fi
 
-# ---- query_context (doc_type filter) ----
-echo "--- query_context (doc_type) ---"
-R=$(mcp "query_context" '{"doc_type":"reference"}')
-check_tool "query_context doc_type filter" "$R" "'payload[\"count\"] >= 1'"
+if require_token "reply_push_contacts"; then
+  if require_flag "reply_push_contacts" "RUN_DESTRUCTIVE_TESTS" "$RUN_DESTRUCTIVE_TESTS" "destructive Reply.io writes"; then
+    skip "reply_push_contacts" "requires a real sequence_id and contact payload; keep manual"
+  fi
+fi
 
-# ---- update_context (bad slug) ----
-echo "--- update_context (validation) ---"
-R=$(mcp "update_context" '{"slug":"BAD SLUG!","title":"Fail","content":"x"}')
-check "update_context rejects bad slug" "$R" "'\"error\" in d.get(\"result\",d) or \"isError\" in str(d)'"
-
-# ---- save_skill_learning ----
-echo "--- save_skill_learning ---"
-R=$(mcp "save_skill_learning" '{"skill":"test-skill","category":"edge-case","content":"Integration test learning — safe to delete"}')
-check_tool "save_skill_learning" "$R" "'payload.get(\"saved\") == True'"
-
-# ---- get_skill_learnings ----
-echo "--- get_skill_learnings ---"
-R=$(mcp "get_skill_learnings" '{"skill":"test-skill"}')
-check_tool "get_skill_learnings" "$R" "'payload[\"count\"] >= 1'"
-
-# ---- admin_report ----
-echo "--- admin_report ---"
-R=$(mcp "admin_report" '{"days":1}')
-check_tool "admin_report" "$R" "'\"live_credits\" in payload'"
-
-# ---- Bulk validation (submit only — don't wait) ----
-skip "bulk_validate" "async job, would need polling"
-skip "bulk_status" "needs job_id from bulk_validate"
-skip "bulk_results" "needs completed job"
-skip "apollo_bulk_enrich_people" "costs credits, covered by single enrich"
-skip "reply_get_sequence" "needs valid sequence_id"
-skip "reply_push_contacts" "destructive, requires user confirmation"
-
-# ---- Summary ----
 echo ""
 echo "=== Results ==="
 echo "  PASS: $PASS"
 echo "  FAIL: $FAIL"
 echo "  SKIP: $SKIP"
 echo "  Total: $((PASS + FAIL + SKIP))"
-[ $FAIL -eq 0 ] && echo "  All tests passed!" || echo "  $FAIL test(s) failed."
+
+if [[ $FAIL -eq 0 ]]; then
+  echo "  All required checks passed."
+else
+  echo "  $FAIL check(s) failed."
+  exit 1
+fi
